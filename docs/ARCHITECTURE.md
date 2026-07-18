@@ -91,7 +91,8 @@ ACL management.
 1. Owner posts text or an attachment in a task channel, or uses a slash command/component.
 2. Relay verifies guild, owner, channel privacy, task binding, and action policy.
 3. Relay converts the interaction to typed app-server parameters and sends one JSON-RPC request.
-4. Codex notifications update coalesced plan, activity, answer, live-operation, realtime, and media state.
+4. Codex notifications update coalesced plan, activity, answer, live-operation, realtime, safety,
+   hook/review, and media state through bounded privacy-safe projections.
 5. Approval or elicitation requests become owner-bound Discord components or modals.
 6. Final answer is written through the durable outbox and the task channel moves to its new state.
 7. If the relay was offline, it scans from the stored channel cursor and replays unprocessed owner

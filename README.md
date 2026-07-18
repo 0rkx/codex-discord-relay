@@ -50,7 +50,8 @@ Public documentation:
   controls; cards honor Codex `availableDecisions`, copy policy amendments only from the server,
   bind replies to the originating app-server process, and expire after 15 minutes
 - Coalesced live-operation and realtime transcript cards expose command output, MCP progress,
-  patch state, lifecycle errors, and bounded PCM16 audio without one Discord message per delta
+  patch state, terminal-input markers, hook/auto-approval review state, model-safety state,
+  realtime controls/signals, and bounded PCM16 audio without one Discord message per delta
 - Completed generated/viewed workspace images and realtime WAV audio use a durable local media
   outbox, safe file validation, Discord attachments, and retry/dead-letter delivery
 - New tasks default to GPT-5.6 Sol, medium reasoning, and live web search, with instructions to

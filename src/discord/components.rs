@@ -48,6 +48,10 @@ pub const PLUGIN_INSTALL: &str = "relay:plugin_install";
 pub const PLUGIN_UNINSTALL: &str = "relay:plugin_uninstall";
 pub const PLUGIN_BACK: &str = "relay:plugin_back";
 pub const PLUGIN_PAGE: &str = "relay:plugin_page";
+pub const REALTIME_START: &str = "relay:realtime_start";
+pub const REALTIME_TEXT: &str = "relay:realtime_text";
+pub const REALTIME_VOICES: &str = "relay:realtime_voices";
+pub const REALTIME_STOP: &str = "relay:realtime_stop";
 
 /// The argument carried after a `prefix:` custom id, if `id` uses that prefix.
 #[must_use]
@@ -109,8 +113,40 @@ pub fn task_buttons(done: bool) -> Vec<CreateActionRow> {
                 .label("Actions")
                 .emoji('⚡')
                 .style(ButtonStyle::Secondary),
+            CreateButton::new(REALTIME_START)
+                .label("Realtime")
+                .emoji('🎙')
+                .style(ButtonStyle::Secondary),
         ]),
     ]
+}
+
+#[must_use]
+pub fn realtime_buttons(active: bool) -> Vec<CreateActionRow> {
+    let mut buttons = vec![
+        CreateButton::new(if active {
+            REALTIME_TEXT
+        } else {
+            REALTIME_START
+        })
+        .label(if active {
+            "Send text"
+        } else {
+            "Start realtime"
+        })
+        .style(ButtonStyle::Primary),
+        CreateButton::new(REALTIME_VOICES)
+            .label("Voices")
+            .style(ButtonStyle::Secondary),
+    ];
+    if active {
+        buttons.push(
+            CreateButton::new(REALTIME_STOP)
+                .label("Stop realtime")
+                .style(ButtonStyle::Danger),
+        );
+    }
+    vec![CreateActionRow::Buttons(buttons)]
 }
 
 #[must_use]
@@ -693,6 +729,19 @@ mod tests {
         assert_eq!(custom_id_arg("relay:action_page", ACTION_PAGE), None);
         assert_eq!(custom_id_arg("relay:action_pagex:1", ACTION_PAGE), None);
         assert_eq!(custom_id_arg("other:action_page:1", ACTION_PAGE), None);
+    }
+
+    #[test]
+    fn realtime_controls_match_session_lifecycle() {
+        let active = serde_json::to_value(realtime_buttons(true)).unwrap();
+        assert_eq!(active[0]["components"][0]["custom_id"], REALTIME_TEXT);
+        assert_eq!(active[0]["components"][1]["custom_id"], REALTIME_VOICES);
+        assert_eq!(active[0]["components"][2]["custom_id"], REALTIME_STOP);
+
+        let inactive = serde_json::to_value(realtime_buttons(false)).unwrap();
+        assert_eq!(inactive[0]["components"][0]["custom_id"], REALTIME_START);
+        assert_eq!(inactive[0]["components"][1]["custom_id"], REALTIME_VOICES);
+        assert_eq!(inactive[0]["components"].as_array().unwrap().len(), 2);
     }
 
     #[test]

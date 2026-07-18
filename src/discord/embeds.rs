@@ -313,6 +313,9 @@ pub fn realtime_card(
     failed: bool,
     version: Option<&str>,
     close_reason: Option<&str>,
+    event_count: u32,
+    last_item_kind: Option<&str>,
+    webrtc_ready: bool,
 ) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
         .title(if active {
@@ -340,6 +343,19 @@ pub fn realtime_card(
     }
     if let Some(reason) = close_reason {
         embed = embed.field("Closed", truncate(reason, 300), false);
+    }
+    if event_count > 0 {
+        embed = embed.field(
+            "Realtime events",
+            format!(
+                "{event_count} received · latest: {}",
+                last_item_kind.unwrap_or("event")
+            ),
+            true,
+        );
+    }
+    if webrtc_ready {
+        embed = embed.field("WebRTC", "Negotiation ready", true);
     }
     embed
 }

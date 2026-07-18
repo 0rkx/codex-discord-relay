@@ -80,9 +80,11 @@ fully accounted:
 
 Only authoritative agent-message data enters the final answer accumulator. This prevents command
 logs or unrelated deltas from corrupting assistant text. In the audited 70-notification snapshot,
-39 methods feed rendered state and 31 are explicitly audit-only, transport-only, standalone, or
-superseded by authoritative completion. Command/MCP/patch progress, realtime transcript/audio,
-and completed image items have dedicated bounded paths.
+48 methods feed rendered state and 22 are explicitly audit-only, transport-only, standalone, or
+superseded by authoritative completion. Command/MCP/patch progress, terminal interactions,
+hook/auto-approval/model-safety state, realtime transcript/audio/signals, and completed image items
+have dedicated bounded paths. Raw terminal input, hook paths/messages, review action contents,
+moderation metadata, and WebRTC SDP are never rendered.
 
 ## End-to-end evidence
 

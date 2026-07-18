@@ -94,9 +94,11 @@ and exists for developer recovery—not routine use.
 - Autocomplete is backed by the installed app-server schema for methods and other live catalogs.
 - Final answer, status, plan, activity, audit, approval, and warning cards use embeds with distinct
   state colors and compact fields.
-- One editable live-operations card coalesces command output, MCP progress, and file-change state.
-  A separate realtime card coalesces transcripts and session lifecycle; PCM16 audio is delivered
-  as a bounded WAV attachment when the session closes.
+- One editable live-operations card coalesces command output, MCP progress, file-change state,
+  terminal-interaction markers, hooks, and auto-approval reviews without exposing their sensitive
+  payloads. A separate realtime card coalesces transcripts, WebRTC/item signals, and session
+  lifecycle, with start/text/voice/stop controls; PCM16 audio is delivered as a bounded WAV
+  attachment when the session closes.
 - Generated images and workspace-confined viewed images are validated by magic bytes and delivered
   as Discord attachments through the durable media outbox.
 

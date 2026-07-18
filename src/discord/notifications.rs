@@ -8,7 +8,12 @@ pub enum NotificationDisposition {
     RealtimeTranscript,
     RealtimeAudio,
     RealtimeLifecycle,
+    RealtimeSignal,
     OperationProgress,
+    TerminalInteraction,
+    AutoApprovalReview,
+    HookLifecycle,
+    ModelSafety,
     StandaloneOutput,
     StandaloneLifecycle,
     TokenUsage,
@@ -106,10 +111,21 @@ pub fn classify(method: &str) -> NotificationDisposition {
         "thread/realtime/started" | "thread/realtime/closed" | "thread/realtime/error" => {
             NotificationDisposition::RealtimeLifecycle
         }
+        "thread/realtime/itemAdded" | "thread/realtime/sdp" => {
+            NotificationDisposition::RealtimeSignal
+        }
         "item/commandExecution/outputDelta"
         | "item/fileChange/outputDelta"
         | "item/fileChange/patchUpdated"
         | "item/mcpToolCall/progress" => NotificationDisposition::OperationProgress,
+        "item/commandExecution/terminalInteraction" => NotificationDisposition::TerminalInteraction,
+        "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
+            NotificationDisposition::AutoApprovalReview
+        }
+        "hook/started" | "hook/completed" => NotificationDisposition::HookLifecycle,
+        "model/safetyBuffering/updated" | "model/verification" => {
+            NotificationDisposition::ModelSafety
+        }
         "command/exec/outputDelta" | "process/outputDelta" => {
             NotificationDisposition::StandaloneOutput
         }
@@ -148,19 +164,10 @@ pub fn classify(method: &str) -> NotificationDisposition {
         | "externalAgentConfig/import/completed"
         | "fs/changed"
         | "fuzzyFileSearch/sessionCompleted"
-        | "hook/completed"
-        | "hook/started"
-        | "item/autoApprovalReview/completed"
-        | "item/autoApprovalReview/started"
-        | "item/commandExecution/terminalInteraction"
         | "mcpServer/startupStatus/updated"
-        | "model/safetyBuffering/updated"
-        | "model/verification"
         | "skills/changed"
         | "thread/goal/cleared"
         | "thread/goal/updated"
-        | "thread/realtime/itemAdded"
-        | "thread/realtime/sdp"
         | "thread/settings/updated"
         | "thread/started"
         | "thread/status/changed"
@@ -216,8 +223,8 @@ mod tests {
             .iter()
             .filter(|method| is_rendered(classify(method)))
             .count();
-        assert_eq!(rendered, 39);
-        assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 31);
+        assert_eq!(rendered, 48);
+        assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 22);
     }
 
     #[test]

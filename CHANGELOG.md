@@ -13,6 +13,8 @@ stable public API is declared.
 - First-class `/plugins` catalog, detail, policy-aware install/uninstall, and authentication UX.
 - Bounded live-operation and realtime projections, validated PCM16 WAV delivery, generated/viewed
   image attachments, and a durable retrying media outbox.
+- Dedicated realtime start/text/voice/stop controls plus privacy-safe terminal interaction,
+  hook lifecycle, auto-approval review, model-safety, WebRTC, and realtime-item projections.
 - Process-generation-bound approvals, server-offered policy amendment controls, cancel/timeout
   parity, resolved-request race tombstones, and 15-minute live request expiry.
 

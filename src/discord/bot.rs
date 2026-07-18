@@ -206,6 +206,9 @@ struct RealtimeDigest {
     audio_sample_rate: Option<u32>,
     audio_channels: Option<u16>,
     audio_truncated: bool,
+    event_count: u32,
+    last_item_kind: Option<String>,
+    webrtc_ready: bool,
 }
 
 #[derive(Default)]
@@ -252,6 +255,9 @@ impl RealtimeDigest {
         self.audio_sample_rate = None;
         self.audio_channels = None;
         self.audio_truncated = false;
+        self.event_count = 0;
+        self.last_item_kind = None;
+        self.webrtc_ready = false;
         self.active = true;
         self.failed = false;
         self.version = version.map(str::to_owned);
@@ -313,6 +319,35 @@ impl RealtimeDigest {
         if let Some(reason) = reason {
             self.close_reason = Some(truncate_chars(reason, 300));
         }
+        self.dirty = true;
+    }
+
+    fn note_item(&mut self, item: &Value) {
+        if !self.active {
+            return;
+        }
+        self.event_count = self.event_count.saturating_add(1);
+        self.last_item_kind = Some(
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => "message",
+                Some("response") => "response",
+                Some("conversation") => "conversation",
+                Some("function_call") => "function call",
+                Some("function_call_output") => "function result",
+                Some("tool_call") => "tool call",
+                Some("tool_result") => "tool result",
+                _ => "event",
+            }
+            .to_owned(),
+        );
+        self.dirty = true;
+    }
+
+    fn note_sdp(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.webrtc_ready = true;
         self.dirty = true;
     }
 
@@ -1144,6 +1179,18 @@ impl Handler {
             self.terminate_terminal(&ctx.http, &component).await?;
         } else if id == components::TERMINAL_CLEAN {
             self.clean_terminals(&ctx.http, &component).await?;
+        } else if id == components::REALTIME_START {
+            self.begin_action(&ctx.http, &component, "thread/realtime/start")
+                .await?;
+        } else if id == components::REALTIME_TEXT {
+            self.begin_action(&ctx.http, &component, "thread/realtime/appendText")
+                .await?;
+        } else if id == components::REALTIME_VOICES {
+            self.begin_action(&ctx.http, &component, "thread/realtime/listVoices")
+                .await?;
+        } else if id == components::REALTIME_STOP {
+            self.begin_action(&ctx.http, &component, "thread/realtime/stop")
+                .await?;
         } else if let Some(rest) = components::custom_id_arg(id, components::ACTION_CONTINUE) {
             let (token, page) = rest
                 .rsplit_once(':')
@@ -5791,6 +5838,26 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
             update_operation_progress(state, &event).await;
             return Ok(());
         }
+        NotificationDisposition::TerminalInteraction => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            project_terminal_interaction(state, &event).await;
+            return Ok(());
+        }
+        NotificationDisposition::AutoApprovalReview => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            project_auto_approval_review(state, &event).await;
+            return Ok(());
+        }
+        NotificationDisposition::HookLifecycle => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            project_hook_lifecycle(state, &event).await;
+            return Ok(());
+        }
+        NotificationDisposition::ModelSafety => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            project_model_safety(state, &event).await;
+            return Ok(());
+        }
         NotificationDisposition::StandaloneOutput => {
             project_standalone_output(state, &event).await;
             return Ok(());
@@ -5915,6 +5982,20 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
             flush_realtime(state, http).await?;
             if let Some((wav, truncated)) = audio {
                 deliver_realtime_audio(state, http, thread_id, wav, truncated).await?;
+            }
+            return Ok(());
+        }
+        NotificationDisposition::RealtimeSignal => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            let Some(thread_id) = thread_id else {
+                return Ok(());
+            };
+            let mut realtime = state.realtime.lock().await;
+            let digest = realtime.entry(thread_id.to_owned()).or_default();
+            if event.method == "thread/realtime/sdp" {
+                digest.note_sdp();
+            } else if let Some(item) = event.params.get("item") {
+                digest.note_item(item);
             }
             return Ok(());
         }
@@ -6889,6 +6970,211 @@ async fn update_operation_progress(state: &BotState, event: &Notification) {
     }
 }
 
+async fn project_terminal_interaction(state: &BotState, event: &Notification) {
+    let (Some(thread_id), Some(item_id)) = (
+        crate::codex::thread_id_from_params(&event.params),
+        event.params.get("itemId").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let byte_count = event
+        .params
+        .get("stdin")
+        .and_then(Value::as_str)
+        .map_or(0, str::len);
+    let command = state
+        .projection
+        .lock()
+        .await
+        .command(thread_id, item_id)
+        .map(format_command_projection)
+        .unwrap_or_else(|| "⌨️ **Interactive command**".to_owned());
+    state
+        .operations
+        .lock()
+        .await
+        .entry(thread_id.to_owned())
+        .or_default()
+        .upsert(
+            item_id,
+            format!("{command}\n↳ terminal input sent · {byte_count} bytes · content hidden"),
+        );
+}
+
+async fn project_auto_approval_review(state: &BotState, event: &Notification) {
+    let (Some(thread_id), Some(review_id)) = (
+        crate::codex::thread_id_from_params(&event.params),
+        event.params.get("reviewId").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let action = match event.params.pointer("/action/type").and_then(Value::as_str) {
+        Some("command") => "command",
+        Some("execve") => "process",
+        Some("applyPatch") => "file changes",
+        Some("networkAccess") => "network access",
+        Some("mcpToolCall") => "MCP tool",
+        Some("requestPermissions") => "permissions",
+        _ => "action",
+    };
+    let status = match event
+        .params
+        .pointer("/review/status")
+        .and_then(Value::as_str)
+    {
+        Some("inProgress") => "reviewing",
+        Some("approved") => "approved",
+        Some("denied") => "denied",
+        Some("timedOut") => "timed out",
+        Some("aborted") => "aborted",
+        _ => "updated",
+    };
+    let risk = match event
+        .params
+        .pointer("/review/riskLevel")
+        .and_then(Value::as_str)
+    {
+        Some("low") => Some("low risk"),
+        Some("medium") => Some("medium risk"),
+        Some("high") => Some("high risk"),
+        Some("critical") => Some("critical risk"),
+        _ => None,
+    };
+    let authorization = match event
+        .params
+        .pointer("/review/userAuthorization")
+        .and_then(Value::as_str)
+    {
+        Some("low") => Some("low authorization"),
+        Some("medium") => Some("medium authorization"),
+        Some("high") => Some("high authorization"),
+        _ => None,
+    };
+    let duration = event
+        .params
+        .get("completedAtMs")
+        .and_then(Value::as_i64)
+        .zip(event.params.get("startedAtMs").and_then(Value::as_i64))
+        .and_then(|(completed, started)| completed.checked_sub(started))
+        .filter(|millis| *millis >= 0)
+        .map(|millis| format!("{millis} ms"));
+    let mut details = vec![action, status];
+    details.extend(risk);
+    details.extend(authorization);
+    let mut summary = format!("🛡️ **Auto-approval review** · {}", details.join(" · "));
+    if let Some(duration) = duration {
+        summary.push_str(&format!(" · {duration}"));
+    }
+    state
+        .operations
+        .lock()
+        .await
+        .entry(thread_id.to_owned())
+        .or_default()
+        .upsert(&format!("review:{review_id}"), summary);
+}
+
+async fn project_hook_lifecycle(state: &BotState, event: &Notification) {
+    let (Some(thread_id), Some(run)) = (
+        crate::codex::thread_id_from_params(&event.params),
+        event.params.get("run"),
+    ) else {
+        return;
+    };
+    let Some(run_id) = run.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let event_name = safe_hook_value(run.get("eventName").and_then(Value::as_str), HOOK_EVENTS);
+    let status = safe_hook_value(run.get("status").and_then(Value::as_str), HOOK_STATUSES);
+    let mode = safe_hook_value(
+        run.get("executionMode").and_then(Value::as_str),
+        &["sync", "async"],
+    );
+    let handler = safe_hook_value(
+        run.get("handlerType").and_then(Value::as_str),
+        &["command", "prompt", "agent"],
+    );
+    let entry_count = run
+        .get("entries")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let duration = run
+        .get("durationMs")
+        .and_then(Value::as_u64)
+        .map(|millis| format!(" · {millis} ms"))
+        .unwrap_or_default();
+    let summary = format!(
+        "🪝 **Hook** · {event_name} · {status} · {mode}/{handler} · {entry_count} entries{duration}"
+    );
+    state
+        .operations
+        .lock()
+        .await
+        .entry(thread_id.to_owned())
+        .or_default()
+        .upsert(&format!("hook:{run_id}"), summary);
+}
+
+const HOOK_EVENTS: &[&str] = &[
+    "preToolUse",
+    "permissionRequest",
+    "postToolUse",
+    "preCompact",
+    "postCompact",
+    "sessionStart",
+    "userPromptSubmit",
+    "subagentStart",
+    "subagentStop",
+    "stop",
+];
+const HOOK_STATUSES: &[&str] = &["running", "completed", "failed", "blocked", "stopped"];
+
+fn safe_hook_value<'a>(value: Option<&'a str>, allowed: &[&str]) -> &'a str {
+    value
+        .filter(|value| allowed.contains(value))
+        .unwrap_or("unknown")
+}
+
+async fn project_model_safety(state: &BotState, event: &Notification) {
+    let Some(thread_id) = crate::codex::thread_id_from_params(&event.params) else {
+        return;
+    };
+    let line = if event.method == "model/safetyBuffering/updated" {
+        let active = event
+            .params
+            .get("showBufferingUi")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let faster = event
+            .params
+            .get("fasterModel")
+            .is_some_and(|value| !value.is_null());
+        format!(
+            "🛡️ Model safety buffering · {}{}",
+            if active { "active" } else { "clear" },
+            if faster {
+                " · faster option available"
+            } else {
+                ""
+            }
+        )
+    } else {
+        let count = event
+            .params
+            .get("verifications")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        format!("✅ Model verification · {count} check(s) received")
+    };
+    let mut activity = state.activity.lock().await;
+    let digest = activity.entry(thread_id.to_owned()).or_default();
+    digest.lines.push(line);
+    if digest.lines.len() > 14 {
+        digest.lines.remove(0);
+    }
+    digest.dirty = true;
+}
+
 async fn complete_operation_item(state: &BotState, thread_id: &str, item: &Value) {
     let Some(item_id) = item.get("id").and_then(Value::as_str) else {
         return;
@@ -7094,7 +7380,10 @@ async fn flush_activity(state: &BotState, http: &Http) -> Result<()> {
         state,
         http,
         &state.activity,
-        |digest| std::mem::take(&mut digest.dirty).then(|| embeds::activity_card(&digest.lines)),
+        |digest| {
+            std::mem::take(&mut digest.dirty)
+                .then(|| DigestRender::embed(embeds::activity_card(&digest.lines)))
+        },
         |digest| digest.dirty = true,
         |digest| &mut digest.message_id,
     )
@@ -7106,7 +7395,10 @@ async fn flush_plans(state: &BotState, http: &Http) -> Result<()> {
         state,
         http,
         &state.plans,
-        |board| std::mem::take(&mut board.dirty).then(|| embeds::plan_card(&board.params)),
+        |board| {
+            std::mem::take(&mut board.dirty)
+                .then(|| DigestRender::embed(embeds::plan_card(&board.params)))
+        },
         |board| board.dirty = true,
         |board| &mut board.message_id,
     )
@@ -7120,7 +7412,7 @@ async fn flush_operations(state: &BotState, http: &Http) -> Result<()> {
         &state.operations,
         |digest| {
             std::mem::take(&mut digest.dirty)
-                .then(|| embeds::live_operations_card(&digest.summaries()))
+                .then(|| DigestRender::embed(embeds::live_operations_card(&digest.summaries())))
         },
         |digest| digest.dirty = true,
         |digest| &mut digest.message_id,
@@ -7134,14 +7426,18 @@ async fn flush_realtime(state: &BotState, http: &Http) -> Result<()> {
         http,
         &state.realtime,
         |digest| {
-            std::mem::take(&mut digest.dirty).then(|| {
-                embeds::realtime_card(
+            std::mem::take(&mut digest.dirty).then(|| DigestRender {
+                embed: embeds::realtime_card(
                     &digest.transcript_text(),
                     digest.active,
                     digest.failed,
                     digest.version.as_deref(),
                     digest.close_reason.as_deref(),
-                )
+                    digest.event_count,
+                    digest.last_item_kind.as_deref(),
+                    digest.webrtc_ready,
+                ),
+                components: components::realtime_buttons(digest.active),
             })
         },
         |digest| digest.dirty = true,
@@ -7428,23 +7724,37 @@ async fn enqueue_media_attachment(
 
 /// Shared per-task digest delivery: snapshot dirty embeds, edit the existing
 /// digest message when possible, otherwise send a fresh one and remember it.
+struct DigestRender {
+    embed: CreateEmbed,
+    components: Vec<CreateActionRow>,
+}
+
+impl DigestRender {
+    fn embed(embed: CreateEmbed) -> Self {
+        Self {
+            embed,
+            components: Vec::new(),
+        }
+    }
+}
+
 async fn flush_digests<T>(
     state: &BotState,
     http: &Http,
     digests: &Mutex<HashMap<String, T>>,
-    mut take_dirty: impl FnMut(&mut T) -> Option<CreateEmbed>,
+    mut take_dirty: impl FnMut(&mut T) -> Option<DigestRender>,
     mut mark_dirty: impl FnMut(&mut T),
     message_id: impl Fn(&mut T) -> &mut Option<u64>,
 ) -> Result<()> {
-    let pending: Vec<(String, CreateEmbed, Option<u64>)> = {
+    let pending: Vec<(String, DigestRender, Option<u64>)> = {
         let mut map = digests.lock().await;
         map.iter_mut()
             .filter_map(|(thread, digest)| {
-                take_dirty(digest).map(|embed| (thread.clone(), embed, *message_id(digest)))
+                take_dirty(digest).map(|render| (thread.clone(), render, *message_id(digest)))
             })
             .collect()
     };
-    for (thread_id, embed, existing) in pending {
+    for (thread_id, render, existing) in pending {
         let Some(task) = state.store.task(&thread_id).await? else {
             if let Some(digest) = digests.lock().await.get_mut(&thread_id) {
                 mark_dirty(digest);
@@ -7463,16 +7773,17 @@ async fn flush_digests<T>(
                     http,
                     existing,
                     EditMessage::new()
-                        .embed(embed.clone())
+                        .embed(render.embed.clone())
+                        .components(render.components.clone())
                         .allowed_mentions(CreateAllowedMentions::new()),
                 )
                 .await
             {
                 Ok(_) => Some(existing),
-                Err(_) => send_digest_message(http, channel, embed).await,
+                Err(_) => send_digest_message(http, channel, render).await,
             }
         } else {
-            send_digest_message(http, channel, embed).await
+            send_digest_message(http, channel, render).await
         };
         if let Some(digest) = digests.lock().await.get_mut(&thread_id) {
             if let Some(delivered) = delivered {
@@ -7485,12 +7796,13 @@ async fn flush_digests<T>(
     Ok(())
 }
 
-async fn send_digest_message(http: &Http, channel: ChannelId, embed: CreateEmbed) -> Option<u64> {
+async fn send_digest_message(http: &Http, channel: ChannelId, render: DigestRender) -> Option<u64> {
     match channel
         .send_message(
             http,
             CreateMessage::new()
-                .embed(embed)
+                .embed(render.embed)
+                .components(render.components)
                 .allowed_mentions(CreateAllowedMentions::new()),
         )
         .await
@@ -9864,8 +10176,8 @@ mod realtime_media_tests {
     use serde_json::json;
 
     use super::{
-        BASE64_STANDARD, RealtimeDigest, decode_inline_image, media_outbox_path,
-        read_workspace_image, safe_media_name, validate_image_bytes,
+        BASE64_STANDARD, HOOK_EVENTS, RealtimeDigest, decode_inline_image, media_outbox_path,
+        read_workspace_image, safe_hook_value, safe_media_name, validate_image_bytes,
     };
 
     fn minimal_png() -> Vec<u8> {
@@ -9996,6 +10308,31 @@ mod realtime_media_tests {
         assert!(digest.transcript_text().is_empty());
         assert!(digest.audio.is_empty());
         assert_eq!(digest.version.as_deref(), Some("v3"));
+    }
+
+    #[test]
+    fn realtime_signals_keep_only_allowlisted_metadata() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.note_item(&json!({
+            "type": "message",
+            "secret": "must never be retained"
+        }));
+        digest.note_item(&json!({"type": "invented-private-kind"}));
+        digest.note_sdp();
+
+        assert_eq!(digest.event_count, 2);
+        assert_eq!(digest.last_item_kind.as_deref(), Some("event"));
+        assert!(digest.webrtc_ready);
+        assert!(!digest.transcript_text().contains("must never be retained"));
+        assert_ne!(
+            digest.last_item_kind.as_deref(),
+            Some("must never be retained")
+        );
+        assert_eq!(
+            safe_hook_value(Some("C:/private/hook.ps1"), HOOK_EVENTS),
+            "unknown"
+        );
     }
 
     #[test]
