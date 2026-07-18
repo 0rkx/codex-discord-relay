@@ -29,10 +29,12 @@ Public documentation:
 - Editable plan and activity embeds summarize turn progress without flooding channels
 - Interrupt, steer, fork, archive, and reopen flows; reopening an archived task unarchives
   it in Codex first so new turns are accepted again
-- Dedicated `/model`, `/review`, `/compact`, `/rollback`, `/rename`, `/skills`, `/apps`,
+- Dedicated `/model`, `/review`, `/compact`, `/rollback`, `/rename`, `/skills`, `/apps`, `/plugins`,
   `/config`, `/account`, `/usage`, and `/capabilities` commands backed by typed Rust helpers
 - `/apps` reads the complete paginated catalog, accepts an optional name filter, and distinguishes
   connected, not-connected, and disabled integrations from Codex's real accessibility fields
+- `/plugins` searches installed and marketplace catalogs, opens full capability details, and offers
+  confirmation-gated install/uninstall controls plus authentication links returned by Codex
 - Task productivity commands: `/goal` (objective/budget tracking), `/history` (recent turn
   digest), `/terminals` (list/terminate/clean background terminals), `/files` (fuzzy workspace
   file search), `/mode` (collaboration presets), and `/effort` (reasoning effort for new turns)

@@ -430,6 +430,34 @@ pub struct McpServerStatusListParams {
     pub thread_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginListParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwds: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marketplace_kinds: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstalledParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwds: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_suggestion_plugin_names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLocatorParams {
+    pub plugin_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub marketplace_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_marketplace_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FuzzyFileSearchParams {
@@ -517,6 +545,28 @@ mod tests {
         assert_eq!(value["threadId"], "thread-1");
         assert_eq!(value["expectedTurnId"], "turn-1");
         assert_eq!(value["input"][0]["type"], "text");
+    }
+
+    #[test]
+    fn plugin_locator_preserves_exact_marketplace_identity() {
+        let local = PluginLocatorParams {
+            plugin_name: "Gmail".into(),
+            marketplace_path: Some("C:/marketplace".into()),
+            remote_marketplace_name: None,
+        };
+        assert_eq!(
+            serde_json::to_value(local).unwrap(),
+            json!({"pluginName":"Gmail","marketplacePath":"C:/marketplace"})
+        );
+        let remote = PluginLocatorParams {
+            plugin_name: "Gmail".into(),
+            marketplace_path: None,
+            remote_marketplace_name: Some("official".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(remote).unwrap(),
+            json!({"pluginName":"Gmail","remoteMarketplaceName":"official"})
+        );
     }
 
     #[test]

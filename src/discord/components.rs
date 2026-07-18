@@ -41,6 +41,12 @@ pub const MODEL_SELECT: &str = "relay:model_select";
 pub const TERMINAL_KILL: &str = "relay:terminal_kill";
 pub const TERMINAL_CLEAN: &str = "relay:terminal_clean";
 pub const MODE_SELECT: &str = "relay:mode_select";
+pub const PLUGIN_ACTIONS: &str = "relay:plugin_actions";
+pub const PLUGIN_SELECT: &str = "relay:plugin_select";
+pub const PLUGIN_INSTALL: &str = "relay:plugin_install";
+pub const PLUGIN_UNINSTALL: &str = "relay:plugin_uninstall";
+pub const PLUGIN_BACK: &str = "relay:plugin_back";
+pub const PLUGIN_PAGE: &str = "relay:plugin_page";
 
 /// The argument carried after a `prefix:` custom id, if `id` uses that prefix.
 #[must_use]
@@ -279,6 +285,111 @@ pub fn answer_buttons(request_id: &str) -> Vec<CreateActionRow> {
             .label("Decline")
             .style(ButtonStyle::Danger),
     ])]
+}
+
+#[must_use]
+pub fn plugin_manage_buttons() -> Vec<CreateActionRow> {
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(PLUGIN_ACTIONS)
+            .label("Manage plugins")
+            .emoji('🧩')
+            .style(ButtonStyle::Primary),
+    ])]
+}
+
+#[must_use]
+pub fn plugin_browser_controls(
+    token: &str,
+    options: impl IntoIterator<Item = (usize, String, String)>,
+    page: usize,
+    pages: usize,
+) -> Vec<CreateActionRow> {
+    let options = options
+        .into_iter()
+        .map(|(index, name, description)| {
+            CreateSelectMenuOption::new(truncate(&name, 100), index.to_string())
+                .description(truncate(&description, 100))
+        })
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    if !options.is_empty() {
+        rows.push(CreateActionRow::SelectMenu(CreateSelectMenu::new(
+            format!("{PLUGIN_SELECT}:{token}"),
+            CreateSelectMenuKind::String { options },
+        )));
+    }
+    if pages > 1 {
+        rows.push(CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "{PLUGIN_PAGE}:{token}:{}",
+                page.saturating_sub(1).max(1)
+            ))
+            .label("Previous")
+            .emoji('◀')
+            .style(ButtonStyle::Secondary)
+            .disabled(page <= 1),
+            CreateButton::new(format!("{PLUGIN_PAGE}:{token}:{}", (page + 1).min(pages)))
+                .label("Next")
+                .emoji('▶')
+                .style(ButtonStyle::Secondary)
+                .disabled(page >= pages),
+        ]));
+    }
+    rows.extend(plugin_manage_buttons());
+    rows
+}
+
+#[must_use]
+pub fn plugin_detail_buttons(
+    token: &str,
+    index: usize,
+    install_action: Option<bool>,
+) -> Vec<CreateActionRow> {
+    let mut buttons = Vec::new();
+    if let Some(install) = install_action {
+        buttons.push(if install {
+            CreateButton::new(format!("{PLUGIN_INSTALL}:{token}:{index}"))
+                .label("Install")
+                .emoji('⬇')
+                .style(ButtonStyle::Success)
+        } else {
+            CreateButton::new(format!("{PLUGIN_UNINSTALL}:{token}:{index}"))
+                .label("Uninstall")
+                .emoji('🗑')
+                .style(ButtonStyle::Danger)
+        });
+    }
+    buttons.extend([
+        CreateButton::new(format!("{PLUGIN_BACK}:{token}:{index}"))
+            .label("Back")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new(PLUGIN_ACTIONS)
+            .label("All plugin actions")
+            .style(ButtonStyle::Secondary),
+    ]);
+    vec![CreateActionRow::Buttons(buttons)]
+}
+
+#[must_use]
+pub fn plugin_auth_buttons(
+    apps: impl IntoIterator<Item = (String, String)>,
+) -> Vec<CreateActionRow> {
+    let buttons = apps
+        .into_iter()
+        .filter(|(_, url)| {
+            url.len() <= 2_048 && (url.starts_with("https://") || url.starts_with("http://"))
+        })
+        .take(20)
+        .map(|(name, url)| {
+            CreateButton::new_link(url)
+                .label(truncate(&format!("Authenticate {name}"), 80))
+                .emoji('🔐')
+        })
+        .collect::<Vec<_>>();
+    buttons
+        .chunks(5)
+        .map(|chunk| CreateActionRow::Buttons(chunk.to_vec()))
+        .collect()
 }
 
 #[must_use]
@@ -548,5 +659,31 @@ mod tests {
         assert_eq!(custom_id_arg("relay:action_page", ACTION_PAGE), None);
         assert_eq!(custom_id_arg("relay:action_pagex:1", ACTION_PAGE), None);
         assert_eq!(custom_id_arg("other:action_page:1", ACTION_PAGE), None);
+    }
+
+    #[test]
+    fn plugin_controls_use_opaque_indices_and_safe_auth_links() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let rows = serde_json::to_value(plugin_browser_controls(
+            token,
+            [(42, "Gmail".to_owned(), "official · email".to_owned())],
+            1,
+            3,
+        ))
+        .unwrap();
+        assert_eq!(
+            rows[0]["components"][0]["custom_id"],
+            format!("{PLUGIN_SELECT}:{token}")
+        );
+        assert_eq!(rows[0]["components"][0]["options"][0]["value"], "42");
+
+        let auth = serde_json::to_value(plugin_auth_buttons([
+            ("Gmail".to_owned(), "https://example.test/auth".to_owned()),
+            ("Unsafe".to_owned(), "file:///secret".to_owned()),
+        ]))
+        .unwrap();
+        assert_eq!(auth.as_array().unwrap().len(), 1);
+        assert_eq!(auth[0]["components"].as_array().unwrap().len(), 1);
+        assert_eq!(auth[0]["components"][0]["url"], "https://example.test/auth");
     }
 }

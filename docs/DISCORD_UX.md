@@ -51,14 +51,14 @@ after task creation or materialization.
 
 ## Command surface
 
-Relay currently registers 30 guild slash commands.
+Relay currently registers 31 guild slash commands.
 
 | Area | Commands | Purpose |
 |---|---|---|
 | Tasks | `/new`, `/tasks`, `/find`, `/status`, `/history` | Create, discover, reopen, and inspect tasks |
 | Turn control | `/interrupt`, `/fork`, `/archive`, `/rename`, `/rollback`, `/compact` | Control task lifecycle and history |
 | Work setup | `/model`, `/mode`, `/effort`, `/goal`, `/files`, `/terminals` | Configure and inspect task execution |
-| Codex features | `/review`, `/skills`, `/apps`, `/mcp`, `/email` | Launch reviews and use installed integrations |
+| Codex features | `/review`, `/skills`, `/apps`, `/plugins`, `/mcp`, `/email` | Launch reviews and use installed integrations |
 | Runtime inspection | `/config`, `/account`, `/usage`, `/capabilities` | Show redacted configuration and live capability state |
 | Protocol access | `/actions`, `/advanced` | Browse schema-routed actions or invoke a raw method |
 | Privileged mode | `/god`, `/god_off` | Start or revoke task-scoped unrestricted execution |
@@ -71,6 +71,11 @@ values that model does not support; GPT-5.6 Sol currently exposes `low` through 
 template. It fetches every Codex cursor with full detail instead of stopping at Discord's first
 25 choices.
 
+`/plugins` searches either installed plugins or all configured marketplaces. Each result page uses
+an opaque, owner-bound selection token; selecting a plugin reads live detail without exposing local
+paths. Install and uninstall reuse Relay's typed GOD confirmation flow. Successful installs render
+Codex-provided app authentication URLs as link buttons when authentication remains necessary.
+
 `/advanced` is task-bound, requires active GOD mode, validates JSON against the installed schema,
 and exists for developer recovery—not routine use.
 
@@ -78,7 +83,7 @@ and exists for developer recovery—not routine use.
 
 - Buttons handle task creation, opening, interruption, state transitions, confirmations, and GOD
   revocation.
-- Select menus handle task lists, action families/methods, models, modes, skills, apps, and files.
+- Select menus handle task lists, action families/methods, models, modes, skills, apps, plugins, and files.
 - Modals collect new-task data, action parameters, approval input, elicitation input, and the GOD
   password without posting it to channel history.
 - Autocomplete is backed by the installed app-server schema for methods and other live catalogs.

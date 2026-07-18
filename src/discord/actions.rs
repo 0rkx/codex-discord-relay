@@ -1624,6 +1624,9 @@ impl ActionDraft {
             .as_ref()
             .map(fields_from_schema)
             .unwrap_or_default();
+        if spec.is_some_and(|spec| spec.input == InputStrategy::NoInput) {
+            fields.clear();
+        }
         let mut params = if capability
             .params_schema
             .as_ref()
@@ -2573,6 +2576,25 @@ mod tests {
         assert_eq!(draft.confirmation, ConfirmationPolicy::Danger);
         assert_eq!(draft.renderer, ActionRenderer::Process);
         assert!(draft.dedicated);
+    }
+
+    #[test]
+    fn no_input_action_ignores_optional_schema_fields() {
+        let capability = MethodCapability {
+            method: "plugin/installed".to_owned(),
+            description: None,
+            title: None,
+            params_schema: Some(json!({
+                "type":"object",
+                "properties":{
+                    "cwds":{"type":"array","items":{"type":"string"}},
+                    "installSuggestionPluginNames":{"type":"array","items":{"type":"string"}}
+                }
+            })),
+        };
+        let draft = ActionDraft::from_capability(&capability, None, 7, None);
+        assert!(draft.fields.is_empty());
+        assert_eq!(draft.params, json!({}));
     }
 
     #[test]

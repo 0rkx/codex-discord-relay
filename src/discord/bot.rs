@@ -38,14 +38,15 @@ use crate::{
         BackgroundTerminalsListParams, CapabilityCatalog, CodexClient, CodexCommand,
         CollaborationModeSetting, CollaborationModeSettings, ConfigReadParams,
         FuzzyFileSearchParams, McpServerStatusListParams, ModelListParams, Notification,
-        ReviewStartParams, ReviewTarget, RpcErrorObject, ServerRequest, SkillsListParams,
-        ThreadForkParams, ThreadGoalSetParams, ThreadListParams, ThreadSearchParams,
-        ThreadSettingsUpdateParams, ThreadStartParams, ThreadTurnsListParams, TurnInterruptParams,
-        TurnStartParams, TurnSteerParams, UserInput, coverage::CoverageReport,
+        PluginInstalledParams, PluginListParams, PluginLocatorParams, ReviewStartParams,
+        ReviewTarget, RpcErrorObject, ServerRequest, SkillsListParams, ThreadForkParams,
+        ThreadGoalSetParams, ThreadListParams, ThreadSearchParams, ThreadSettingsUpdateParams,
+        ThreadStartParams, ThreadTurnsListParams, TurnInterruptParams, TurnStartParams,
+        TurnSteerParams, UserInput, coverage::CoverageReport,
     },
     config::{self, Config},
     discord::{
-        actions::{self, ActionAuthorization, ActionDraft},
+        actions::{self, ActionAuthorization, ActionDraft, ActionSurface},
         components, embeds, notifications,
         provision::{self, Layout},
         requests::{
@@ -184,7 +185,18 @@ struct TaskBrowserDraft {
     created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Clone)]
+struct PluginBrowserDraft {
+    rows: Vec<PluginCatalogRow>,
+    scope: String,
+    load_error_count: usize,
+    channel_id: u64,
+    owner_id: u64,
+    created_at: chrono::DateTime<Utc>,
+}
+
 const TASK_BROWSER_TTL_MINUTES: i64 = 20;
+const PLUGIN_BROWSER_TTL_MINUTES: i64 = 20;
 
 #[derive(Clone, Copy)]
 struct CodexExecutionPolicy {
@@ -292,6 +304,12 @@ impl TaskBrowserDraft {
     }
 }
 
+impl PluginBrowserDraft {
+    fn expired(&self) -> bool {
+        Utc::now() - self.created_at > chrono::Duration::minutes(PLUGIN_BROWSER_TTL_MINUTES)
+    }
+}
+
 struct BotState {
     config: Arc<Config>,
     store: StateStore,
@@ -318,6 +336,7 @@ struct BotState {
     pending_request_messages: dashmap::DashMap<String, (u64, u64)>,
     action_drafts: dashmap::DashMap<String, ActionDraft>,
     task_browsers: dashmap::DashMap<String, TaskBrowserDraft>,
+    plugin_browsers: dashmap::DashMap<String, PluginBrowserDraft>,
     runner_status_message_id: AtomicU64,
     god_warning_channel_id: AtomicU64,
     god_warning_message_id: AtomicU64,
@@ -351,6 +370,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "model",
     "skills",
     "apps",
+    "plugins",
     "config",
     "account",
     "usage",
@@ -730,6 +750,7 @@ impl Handler {
             "model" => self.models(&ctx.http, &command).await?,
             "skills" => self.skills(&ctx.http, &command).await?,
             "apps" => self.apps(&ctx.http, &command).await?,
+            "plugins" => self.plugins(&ctx.http, &command).await?,
             "config" => self.config_summary(&ctx.http, &command).await?,
             "account" => self.account(&ctx.http, &command).await?,
             "usage" => self.usage(&ctx.http, &command).await?,
@@ -781,6 +802,42 @@ impl Handler {
                 .await?;
         } else if id == components::ACTION_BROWSER {
             self.show_action_categories(&ctx.http, CommandResponder::Component(&component))
+                .await?;
+        } else if id == components::PLUGIN_ACTIONS {
+            self.show_action_methods(
+                &ctx.http,
+                &component,
+                ActionSurface::PluginsAndMarketplace.slug(),
+                0,
+            )
+            .await?;
+        } else if let Some(token) = components::custom_id_arg(id, components::PLUGIN_SELECT) {
+            let index = selected_value(&component)?.parse()?;
+            self.show_plugin_detail(&ctx.http, &component, token, index)
+                .await?;
+        } else if let Some(rest) = components::custom_id_arg(id, components::PLUGIN_BACK) {
+            let (token, index) = rest
+                .rsplit_once(':')
+                .context("invalid plugin back control")?;
+            self.show_plugin_browser_page(&ctx.http, &component, token, index.parse()?)
+                .await?;
+        } else if let Some(rest) = components::custom_id_arg(id, components::PLUGIN_PAGE) {
+            let (token, page) = rest
+                .rsplit_once(':')
+                .context("invalid plugin page control")?;
+            self.show_plugin_browser_page_number(&ctx.http, &component, token, page.parse()?)
+                .await?;
+        } else if let Some(rest) = components::custom_id_arg(id, components::PLUGIN_INSTALL) {
+            let (token, index) = rest
+                .rsplit_once(':')
+                .context("invalid plugin install control")?;
+            self.begin_plugin_mutation(&ctx.http, &component, token, index.parse()?, true)
+                .await?;
+        } else if let Some(rest) = components::custom_id_arg(id, components::PLUGIN_UNINSTALL) {
+            let (token, index) = rest
+                .rsplit_once(':')
+                .context("invalid plugin uninstall control")?;
+            self.begin_plugin_mutation(&ctx.http, &component, token, index.parse()?, false)
                 .await?;
         } else if id == components::ACTION_CATEGORY {
             let value = selected_value(&component)?;
@@ -1781,6 +1838,11 @@ impl Handler {
             .codex
             .request_value(&draft.method, draft.params.clone())
             .await?;
+        let result_controls = if draft.method == "plugin/install" {
+            components::plugin_auth_buttons(plugin_auth_links(&result))
+        } else {
+            Vec::new()
+        };
         if let Err(error) = self
             .state
             .store
@@ -1816,7 +1878,7 @@ impl Handler {
                 1,
                 pages.len().max(1),
             ))
-            .components(Vec::new());
+            .components(result_controls);
         if pages.len() > 1 {
             response = response.new_attachment(CreateAttachment::bytes(
                 pretty.into_bytes(),
@@ -2920,6 +2982,309 @@ impl Handler {
             .edit_response(
                 http,
                 EditInteractionResponse::new().embed(embeds::info_card("Codex apps", &lines)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn plugins(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
+        let scope = string_command_option(command, "scope").unwrap_or("installed");
+        let method = match scope {
+            "installed" => "plugin/installed",
+            "catalog" => "plugin/list",
+            _ => anyhow::bail!("unknown plugin scope `{scope}`"),
+        };
+        self.require_installed_method(method)?;
+        defer_command(http, command).await?;
+        let query = string_command_option(command, "query")
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_ascii_lowercase);
+        let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
+        let cwd = self
+            .state
+            .store
+            .task_by_channel(command.channel_id.get())
+            .await?
+            .and_then(|task| task.cwd);
+        let result = if scope == "installed" {
+            self.state
+                .codex
+                .plugin_installed(PluginInstalledParams {
+                    cwds: cwd.map(|cwd| vec![cwd]),
+                    install_suggestion_plugin_names: None,
+                })
+                .await?
+        } else {
+            self.state
+                .codex
+                .plugin_list(PluginListParams {
+                    cwds: cwd.map(|cwd| vec![cwd]),
+                    marketplace_kinds: None,
+                })
+                .await?
+        };
+        let load_error_count = plugin_load_error_count(&result);
+        let mut rows = plugin_catalog_rows(&result);
+        if scope == "installed" {
+            rows.retain(|row| row.installed);
+        }
+        if let Some(query) = query.as_deref() {
+            rows.retain(|row| {
+                [&row.name, &row.id, &row.marketplace, &row.description]
+                    .into_iter()
+                    .any(|value| value.to_ascii_lowercase().contains(query))
+            });
+        }
+        rows.sort_by_key(|row| {
+            (
+                !row.installed,
+                !row.enabled,
+                row.name.to_ascii_lowercase(),
+                row.marketplace.to_ascii_lowercase(),
+            )
+        });
+        self.state
+            .plugin_browsers
+            .retain(|_, draft| !draft.expired());
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let draft = PluginBrowserDraft {
+            rows,
+            scope: scope.to_owned(),
+            load_error_count,
+            channel_id: command.channel_id.get(),
+            owner_id: command.user.id.get(),
+            created_at: Utc::now(),
+        };
+        let (embed, controls) = plugin_browser_view(&draft, requested_page, &token);
+        self.state.plugin_browsers.insert(token, draft);
+        command
+            .edit_response(
+                http,
+                EditInteractionResponse::new()
+                    .embed(embed)
+                    .components(controls),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn plugin_browser_row(
+        &self,
+        component: &ComponentInteraction,
+        token: &str,
+        index: usize,
+    ) -> Result<PluginCatalogRow> {
+        let draft = self
+            .state
+            .plugin_browsers
+            .get(token)
+            .map(|draft| draft.clone())
+            .context("plugin browser expired; run /plugins again")?;
+        anyhow::ensure!(
+            !draft.expired(),
+            "plugin browser expired; run /plugins again"
+        );
+        anyhow::ensure!(
+            draft.channel_id == component.channel_id.get()
+                && draft.owner_id == component.user.id.get(),
+            "plugin browser belongs to another user or channel"
+        );
+        draft
+            .rows
+            .get(index)
+            .cloned()
+            .context("plugin selection is no longer available")
+    }
+
+    async fn show_plugin_detail(
+        &self,
+        http: &Http,
+        component: &ComponentInteraction,
+        token: &str,
+        index: usize,
+    ) -> Result<()> {
+        self.require_installed_method("plugin/read")?;
+        let row = self.plugin_browser_row(component, token, index)?;
+        defer_component(http, component).await?;
+        let result = self
+            .state
+            .codex
+            .plugin_read(PluginLocatorParams {
+                plugin_name: row.name.clone(),
+                marketplace_path: row.marketplace_path.clone(),
+                remote_marketplace_name: row.remote_marketplace_name.clone(),
+            })
+            .await?;
+        let detail = result.get("plugin").unwrap_or(&result);
+        let summary = detail.get("summary").unwrap_or(detail);
+        let auth = summary
+            .get("authPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown auth policy");
+        let install_policy = summary
+            .get("installPolicy")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown install policy");
+        let source = summary
+            .pointer("/source/type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown source");
+        let counts = [
+            ("apps", detail.get("apps")),
+            ("skills", detail.get("skills")),
+            ("MCP servers", detail.get("mcpServers")),
+            ("hooks", detail.get("hooks")),
+            ("scheduled tasks", detail.get("scheduledTasks")),
+        ]
+        .into_iter()
+        .map(|(label, value)| {
+            format!(
+                "{} {label}",
+                value.and_then(Value::as_array).map_or(0, Vec::len)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let description = detail
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(&row.description)
+            .replace('\n', " ");
+        let lines = format!(
+            "{}\n\n**Marketplace:** {}\n**Status:** {} · {}\n**Source:** {}\n**Capabilities:** {}",
+            description.chars().take(900).collect::<String>(),
+            row.marketplace,
+            auth,
+            install_policy,
+            source,
+            counts
+        );
+        component
+            .edit_response(
+                http,
+                EditInteractionResponse::new()
+                    .embed(embeds::info_card(&format!("Plugin: {}", row.name), &lines))
+                    .components(components::plugin_detail_buttons(
+                        token,
+                        index,
+                        plugin_available_mutation(&row),
+                    )),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn show_plugin_browser_page(
+        &self,
+        http: &Http,
+        component: &ComponentInteraction,
+        token: &str,
+        index: usize,
+    ) -> Result<()> {
+        self.show_plugin_browser_page_number(http, component, token, index / 10 + 1)
+            .await
+    }
+
+    async fn show_plugin_browser_page_number(
+        &self,
+        http: &Http,
+        component: &ComponentInteraction,
+        token: &str,
+        page: usize,
+    ) -> Result<()> {
+        let draft = self
+            .state
+            .plugin_browsers
+            .get(token)
+            .map(|draft| draft.clone())
+            .context("plugin browser expired; run /plugins again")?;
+        anyhow::ensure!(
+            !draft.expired()
+                && draft.channel_id == component.channel_id.get()
+                && draft.owner_id == component.user.id.get(),
+            "plugin browser expired or belongs to another user/channel"
+        );
+        let (embed, controls) = plugin_browser_view(&draft, page, token);
+        component
+            .create_response(
+                http,
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .components(controls),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn begin_plugin_mutation(
+        &self,
+        http: &Http,
+        component: &ComponentInteraction,
+        browser_token: &str,
+        index: usize,
+        install: bool,
+    ) -> Result<()> {
+        let row = self.plugin_browser_row(component, browser_token, index)?;
+        anyhow::ensure!(
+            plugin_available_mutation(&row) == Some(install),
+            "this plugin cannot be changed under its current marketplace policy"
+        );
+        anyhow::ensure!(
+            row.installed != install,
+            if install {
+                "plugin is already installed"
+            } else {
+                "plugin is not installed"
+            }
+        );
+        let method = if install {
+            "plugin/install"
+        } else {
+            "plugin/uninstall"
+        };
+        let capability = self
+            .state
+            .capabilities
+            .client_request(method)
+            .with_context(|| format!("Codex no longer advertises {method}"))?;
+        let task = self
+            .state
+            .store
+            .task_by_channel(component.channel_id.get())
+            .await?;
+        let mut draft = ActionDraft::from_capability(
+            capability,
+            task.as_ref().map(|task| task.thread_id.clone()),
+            component.channel_id.get(),
+            task.as_ref()
+                .and_then(|task| task.cwd.as_deref())
+                .or_else(|| {
+                    self.state
+                        .config
+                        .default_cwd
+                        .as_deref()
+                        .and_then(|path| path.to_str())
+                }),
+        );
+        draft.params = plugin_mutation_params(&row, install);
+        draft.fields.clear();
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        self.state
+            .action_drafts
+            .insert(token.clone(), draft.clone());
+        let (embed, controls) = action_confirmation(&draft, &token);
+        component
+            .create_response(
+                http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .embed(embed)
+                        .components(controls)
+                        .ephemeral(true),
+                ),
             )
             .await?;
         Ok(())
@@ -4056,6 +4421,7 @@ pub async fn run() -> Result<()> {
         pending_request_messages: dashmap::DashMap::new(),
         action_drafts: dashmap::DashMap::new(),
         task_browsers: dashmap::DashMap::new(),
+        plugin_browsers: dashmap::DashMap::new(),
         runner_status_message_id: AtomicU64::new(0),
         god_warning_channel_id: AtomicU64::new(0),
         god_warning_message_id: AtomicU64::new(0),
@@ -4183,6 +4549,28 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                 CreateCommandOption::new(CommandOptionType::Integer, "page", "Result page")
                     .min_int_value(1)
                     .max_int_value(100)
+                    .required(false),
+            ),
+        CommandBuilder::new("plugins")
+            .description("Browse installed plugins or every configured marketplace")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "scope", "Plugin source")
+                    .add_string_choice("Installed", "installed")
+                    .add_string_choice("Marketplace catalog", "catalog")
+                    .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "query",
+                    "Filter by plugin, marketplace, id, or description",
+                )
+                .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::Integer, "page", "Result page")
+                    .min_int_value(1)
+                    .max_int_value(10_000)
                     .required(false),
             ),
         CommandBuilder::new("config").description("Show effective Codex config, redacted"),
@@ -6479,6 +6867,224 @@ fn mcp_view_label(view: &str) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginCatalogRow {
+    id: String,
+    name: String,
+    marketplace: String,
+    marketplace_path: Option<String>,
+    remote_marketplace_name: Option<String>,
+    description: String,
+    version: Option<String>,
+    installed: bool,
+    enabled: bool,
+    availability: Option<String>,
+    install_policy: Option<String>,
+}
+
+fn plugin_catalog_rows(value: &Value) -> Vec<PluginCatalogRow> {
+    let root = value.get("data").unwrap_or(value);
+    let marketplaces = root
+        .get("marketplaces")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut rows = Vec::new();
+    for marketplace in marketplaces {
+        let marketplace_name = marketplace
+            .get("name")
+            .or_else(|| marketplace.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown marketplace");
+        let marketplace_path = marketplace.get("path").and_then(Value::as_str);
+        if let Some(plugins) = marketplace.get("plugins").and_then(Value::as_array) {
+            rows.extend(
+                plugins
+                    .iter()
+                    .map(|plugin| plugin_catalog_row(plugin, marketplace_name, marketplace_path)),
+            );
+        }
+    }
+    if rows.is_empty()
+        && let Some(plugins) = root.get("plugins").and_then(Value::as_array)
+    {
+        rows.extend(
+            plugins
+                .iter()
+                .map(|plugin| plugin_catalog_row(plugin, "unknown marketplace", None)),
+        );
+    }
+    rows
+}
+
+fn plugin_catalog_row(
+    plugin: &Value,
+    marketplace: &str,
+    marketplace_path: Option<&str>,
+) -> PluginCatalogRow {
+    let name = plugin
+        .get("name")
+        .or_else(|| plugin.get("id"))
+        .or_else(|| plugin.get("remotePluginId"))
+        .and_then(Value::as_str)
+        .unwrap_or("unnamed plugin");
+    let id = plugin
+        .get("id")
+        .or_else(|| plugin.get("remotePluginId"))
+        .and_then(Value::as_str)
+        .unwrap_or(name);
+    let description = plugin
+        .get("description")
+        .or_else(|| plugin.get("shortDescription"))
+        .or_else(|| plugin.pointer("/interface/shortDescription"))
+        .or_else(|| plugin.pointer("/interface/longDescription"))
+        .and_then(Value::as_str)
+        .unwrap_or("No description supplied")
+        .replace('\n', " ");
+    PluginCatalogRow {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        marketplace: marketplace.to_owned(),
+        marketplace_path: marketplace_path.map(str::to_owned),
+        remote_marketplace_name: marketplace_path.is_none().then(|| marketplace.to_owned()),
+        description,
+        version: plugin
+            .get("localVersion")
+            .or_else(|| plugin.get("version"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        installed: plugin
+            .get("installed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        enabled: plugin
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        availability: plugin
+            .get("availability")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        install_policy: plugin
+            .get("installPolicy")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn plugin_browser_view(
+    draft: &PluginBrowserDraft,
+    requested_page: usize,
+    token: &str,
+) -> (CreateEmbed, Vec<CreateActionRow>) {
+    let (start, end, page, pages) = page_window(draft.rows.len(), requested_page, 10);
+    let mut lines = String::new();
+    for row in &draft.rows[start..end] {
+        let status = if !row.enabled {
+            "disabled"
+        } else if row.installed {
+            "installed"
+        } else {
+            "available"
+        };
+        let version = row
+            .version
+            .as_deref()
+            .map(|version| format!(" · v{version}"))
+            .unwrap_or_default();
+        lines.push_str(&format!(
+            "**{}** · {} · {}{}\n   {}\n",
+            row.name.chars().take(100).collect::<String>(),
+            row.marketplace.chars().take(80).collect::<String>(),
+            status,
+            version,
+            row.description.chars().take(140).collect::<String>()
+        ));
+    }
+    if lines.is_empty() {
+        lines.push_str("No matching plugins.");
+    }
+    lines.push_str(&format!(
+        "\nPage {page}/{pages} · {} {} plugins",
+        draft.rows.len(),
+        draft.scope
+    ));
+    if draft.load_error_count > 0 {
+        lines.push_str(&format!(
+            "\n⚠ {} marketplace(s) failed to load; diagnostics remain redacted.",
+            draft.load_error_count
+        ));
+    }
+    let options = draft.rows[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            (
+                start + offset,
+                row.name.clone(),
+                format!("{} · {}", row.marketplace, row.description),
+            )
+        });
+    (
+        embeds::info_card("Codex plugins", &lines),
+        components::plugin_browser_controls(token, options, page, pages),
+    )
+}
+
+fn plugin_auth_links(value: &Value) -> Vec<(String, String)> {
+    value
+        .get("appsNeedingAuth")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|app| {
+            let name = app
+                .get("name")
+                .or_else(|| app.get("id"))
+                .and_then(Value::as_str)?;
+            let url = app.get("installUrl").and_then(Value::as_str)?;
+            Some((name.to_owned(), url.to_owned()))
+        })
+        .collect()
+}
+
+fn plugin_load_error_count(value: &Value) -> usize {
+    value
+        .get("marketplaceLoadErrors")
+        .or_else(|| value.pointer("/data/marketplaceLoadErrors"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+fn plugin_mutation_params(row: &PluginCatalogRow, install: bool) -> Value {
+    if !install {
+        return json!({"pluginId": row.id});
+    }
+    let mut params = json!({
+        "pluginName": row.name,
+        "marketplacePath": row.marketplace_path,
+        "remoteMarketplaceName": row.remote_marketplace_name
+    });
+    if let Some(object) = params.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    params
+}
+
+fn plugin_available_mutation(row: &PluginCatalogRow) -> Option<bool> {
+    if !row.enabled
+        || row.availability.as_deref() == Some("DISABLED_BY_ADMIN")
+        || row.install_policy.as_deref() == Some("NOT_AVAILABLE")
+    {
+        return None;
+    }
+    if row.installed {
+        (row.install_policy.as_deref() != Some("INSTALLED_BY_DEFAULT")).then_some(false)
+    } else {
+        Some(true)
+    }
+}
+
 fn first_result_array<'a>(value: &'a Value, keys: &[&str]) -> &'a [Value] {
     for key in keys {
         if let Some(values) = value.get(*key).and_then(Value::as_array) {
@@ -7328,7 +7934,10 @@ mod god_safety_tests {
 mod capability_list_tests {
     use serde_json::json;
 
-    use super::{collect_skills, mcp_catalog_rows, model_reasoning_efforts, page_window};
+    use super::{
+        collect_skills, mcp_catalog_rows, model_reasoning_efforts, page_window, plugin_auth_links,
+        plugin_available_mutation, plugin_catalog_rows, plugin_mutation_params,
+    };
 
     #[test]
     fn current_grouped_skills_response_is_flattened() {
@@ -7403,6 +8012,67 @@ mod capability_list_tests {
 
         let status = mcp_catalog_rows(servers, "servers").unwrap();
         assert_eq!(status[0].description, "2 tools · 1 resources · 1 templates");
+    }
+
+    #[test]
+    fn plugin_catalog_flattens_marketplaces_and_preserves_status() {
+        let result = json!({
+            "marketplaces":[{
+                "name":"official",
+                "path":"C:/plugins",
+                "plugins":[{
+                    "id":"gmail",
+                    "name":"Gmail",
+                    "installed":true,
+                    "enabled":false,
+                    "availability":"AVAILABLE",
+                    "installPolicy":"AVAILABLE",
+                    "localVersion":"1.2.3",
+                    "interface":{"shortDescription":"Read and send email"}
+                }]
+            }]
+        });
+        let rows = plugin_catalog_rows(&result);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "gmail");
+        assert_eq!(rows[0].name, "Gmail");
+        assert_eq!(rows[0].marketplace, "official");
+        assert_eq!(rows[0].marketplace_path.as_deref(), Some("C:/plugins"));
+        assert!(rows[0].remote_marketplace_name.is_none());
+        assert_eq!(rows[0].description, "Read and send email");
+        assert_eq!(rows[0].version.as_deref(), Some("1.2.3"));
+        assert!(rows[0].installed);
+        assert!(!rows[0].enabled);
+        assert_eq!(plugin_available_mutation(&rows[0]), None);
+        let mut available = rows[0].clone();
+        available.enabled = true;
+        available.installed = false;
+        assert_eq!(plugin_available_mutation(&available), Some(true));
+        available.installed = true;
+        available.install_policy = Some("INSTALLED_BY_DEFAULT".to_owned());
+        assert_eq!(plugin_available_mutation(&available), None);
+        assert_eq!(
+            plugin_mutation_params(&rows[0], true),
+            json!({"pluginName":"Gmail","marketplacePath":"C:/plugins"})
+        );
+        assert_eq!(
+            plugin_mutation_params(&rows[0], false),
+            json!({"pluginId":"gmail"})
+        );
+    }
+
+    #[test]
+    fn plugin_install_auth_links_use_only_named_install_urls() {
+        let result = json!({
+            "appsNeedingAuth":[
+                {"id":"gmail","name":"Gmail","installUrl":"https://example.test/auth"},
+                {"id":"broken","name":"Broken"}
+            ]
+        });
+        assert_eq!(
+            plugin_auth_links(&result),
+            [("Gmail".to_owned(), "https://example.test/auth".to_owned())]
+        );
     }
 }
 

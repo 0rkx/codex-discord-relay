@@ -43,12 +43,12 @@ use tokio::{
 use super::protocol::{
     AccountReadParams, AppListParams, BackgroundTerminalTerminateParams,
     BackgroundTerminalsListParams, ConfigReadParams, FuzzyFileSearchParams,
-    McpServerStatusListParams, ModelListParams, Notification, ReviewStartParams, RpcErrorObject,
-    ServerRequest, SkillsListParams, ThreadForkParams, ThreadGoalSetParams, ThreadIdParams,
-    ThreadListParams, ThreadNameSetParams, ThreadReadParams, ThreadResumeParams,
-    ThreadRollbackParams, ThreadSearchParams, ThreadSettingsUpdateParams, ThreadStartParams,
-    ThreadTurnsListParams, TurnInterruptParams, TurnStartParams, TurnSteerParams, WireMessage,
-    classify_message,
+    McpServerStatusListParams, ModelListParams, Notification, PluginInstalledParams,
+    PluginListParams, PluginLocatorParams, ReviewStartParams, RpcErrorObject, ServerRequest,
+    SkillsListParams, ThreadForkParams, ThreadGoalSetParams, ThreadIdParams, ThreadListParams,
+    ThreadNameSetParams, ThreadReadParams, ThreadResumeParams, ThreadRollbackParams,
+    ThreadSearchParams, ThreadSettingsUpdateParams, ThreadStartParams, ThreadTurnsListParams,
+    TurnInterruptParams, TurnStartParams, TurnSteerParams, WireMessage, classify_message,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -793,6 +793,21 @@ impl CodexClient {
         params: McpServerStatusListParams,
     ) -> Result<Value, ClientError> {
         self.request("mcpServerStatus/list", params).await
+    }
+
+    pub async fn plugin_list(&self, params: PluginListParams) -> Result<Value, ClientError> {
+        self.request("plugin/list", params).await
+    }
+
+    pub async fn plugin_installed(
+        &self,
+        params: PluginInstalledParams,
+    ) -> Result<Value, ClientError> {
+        self.request("plugin/installed", params).await
+    }
+
+    pub async fn plugin_read(&self, params: PluginLocatorParams) -> Result<Value, ClientError> {
+        self.request("plugin/read", params).await
     }
 
     pub async fn fuzzy_file_search(
@@ -1611,6 +1626,84 @@ mod tests {
                     .is_some_and(|tools| !tools.is_empty())
             }),
             "full MCP detail returned no browsable tools"
+        );
+        client.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the locally installed Codex app-server"]
+    async fn live_installed_plugins_have_marketplace_entries() {
+        let client = CodexClient::discover().unwrap();
+        let result = client
+            .plugin_installed(PluginInstalledParams::default())
+            .await
+            .unwrap();
+        let marketplaces = result
+            .get("marketplaces")
+            .or_else(|| result.pointer("/data/marketplaces"))
+            .and_then(Value::as_array)
+            .expect("plugin/installed returned no marketplaces array");
+        assert!(
+            marketplaces.iter().any(|marketplace| {
+                marketplace
+                    .get("plugins")
+                    .and_then(Value::as_array)
+                    .is_some_and(|plugins| !plugins.is_empty())
+            }),
+            "installed Codex returned no plugin entries"
+        );
+        let (plugin_name, marketplace_path, remote_marketplace_name) = marketplaces
+            .iter()
+            .find_map(|marketplace| {
+                let plugin = marketplace
+                    .get("plugins")?
+                    .as_array()?
+                    .iter()
+                    .find(|plugin| {
+                        plugin
+                            .get("installed")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            && plugin.get("name").and_then(Value::as_str).is_some()
+                    })?;
+                let name = plugin.get("name")?.as_str()?.to_owned();
+                let path = marketplace
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let remote_name = path.is_none().then(|| {
+                    marketplace
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned()
+                });
+                Some((name, path, remote_name))
+            })
+            .expect("plugin/installed returned no installed plugin locator");
+        let detail = client
+            .plugin_read(PluginLocatorParams {
+                plugin_name,
+                marketplace_path,
+                remote_marketplace_name,
+            })
+            .await
+            .unwrap();
+        assert!(
+            detail.pointer("/plugin/summary").is_some(),
+            "plugin/read returned no plugin summary"
+        );
+        let catalog = client
+            .plugin_list(PluginListParams::default())
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .get("marketplaces")
+                .or_else(|| catalog.pointer("/data/marketplaces"))
+                .and_then(Value::as_array)
+                .is_some_and(|marketplaces| !marketplaces.is_empty()),
+            "plugin/list returned no marketplace catalog"
         );
         client.close().await;
     }
