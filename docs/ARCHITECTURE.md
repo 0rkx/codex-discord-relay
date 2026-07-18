@@ -116,8 +116,8 @@ ACL management.
 - Creating a Discord application or server through the Discord API.
 - Replacing Codex Desktop authentication with an OpenAI API key.
 - Exposing Relay itself as an OpenAI-compatible HTTP API.
-- Dynamic client-side tools, ChatGPT token refresh, and device attestation are not advertised as
-  host capabilities.
+- ChatGPT token refresh and device attestation are not advertised as host capabilities. Dynamic
+  client-side tools are limited to Relay's explicit read-only Rust HostBroker allowlist.
 
 See [SECURITY.md](SECURITY.md) for trust boundaries and [COVERAGE.md](COVERAGE.md) for precise
 coverage terminology.

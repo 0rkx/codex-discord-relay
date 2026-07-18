@@ -5,6 +5,13 @@ stable public API is declared.
 
 ## [Unreleased]
 
+### Added
+
+- Native Rust HostBroker with real `codex_app.list_threads` and `codex_app.read_thread` dynamic
+  tools, bounded concurrent routing, rich activity rendering, and live-tested cold resume/fork
+  inheritance.
+- First-class `/plugins` catalog, detail, policy-aware install/uninstall, and authentication UX.
+
 ## [0.1.1] - 2026-07-18
 
 ### Added

@@ -47,7 +47,9 @@ use crate::{
     config::{self, Config},
     discord::{
         actions::{self, ActionAuthorization, ActionDraft, ActionSurface},
-        components, embeds, notifications,
+        components, embeds,
+        host_broker::HostBroker,
+        notifications,
         provision::{self, Layout},
         requests::{
             self, ApprovalDecision, LegacyApprovalDecision, McpElicitationAction, PermissionGrant,
@@ -314,6 +316,7 @@ struct BotState {
     config: Arc<Config>,
     store: StateStore,
     codex: CodexClient,
+    host_broker: HostBroker,
     /// Subscribed in `run()` before the first Codex connect and consumed once
     /// by `spawn_codex_listeners`, so events emitted while the Discord gateway
     /// starts are buffered rather than lost.
@@ -1026,6 +1029,7 @@ impl Handler {
                 personality: None,
                 developer_instructions: Some(RELAY_DEVELOPER_INSTRUCTIONS.to_owned()),
                 runtime_workspace_roots: cwd.clone().map(|path| vec![path]),
+                dynamic_tools: Some(HostBroker::dynamic_tool_specs()),
                 extra: BTreeMap::from([("config".to_owned(), json!({"web_search": "live"}))]),
             })
             .await?;
@@ -4395,6 +4399,7 @@ pub async fn run() -> Result<()> {
     let client_methods = capabilities.client_requests.iter().cloned().collect();
     let capabilities = Arc::new(capabilities);
     let codex = CodexClient::new(codex_command);
+    let host_broker = HostBroker::new(codex.clone(), store.clone());
     // Subscribe before the first connect: notifications Codex emits while the
     // Discord gateway is still starting buffer in these receivers until
     // `spawn_codex_listeners` drains them at gateway-ready.
@@ -4407,6 +4412,7 @@ pub async fn run() -> Result<()> {
         config,
         store,
         codex,
+        host_broker,
         early_codex_receivers,
         god: RwLock::new(god),
         god_password_configured: AtomicBool::new(god_password_configured),
@@ -4740,12 +4746,28 @@ fn spawn_codex_listeners(state: Arc<BotState>, http: Arc<Http>) {
         }
     });
     tokio::spawn(async move {
+        let dynamic_tool_concurrency = Arc::new(tokio::sync::Semaphore::new(8));
+        let interactive_concurrency = Arc::new(tokio::sync::Semaphore::new(32));
         loop {
             match requests.recv().await {
                 Ok(request) => {
-                    if let Err(error) = handle_server_request(&state, &http, request).await {
-                        error!(%error, "server request handling failed");
-                    }
+                    let state = Arc::clone(&state);
+                    let http = Arc::clone(&http);
+                    let concurrency = if ServerRequestMethod::classify(&request.method)
+                        == ServerRequestMethod::DynamicToolCall
+                    {
+                        Arc::clone(&dynamic_tool_concurrency)
+                    } else {
+                        Arc::clone(&interactive_concurrency)
+                    };
+                    tokio::spawn(async move {
+                        let Ok(_permit) = concurrency.acquire_owned().await else {
+                            return;
+                        };
+                        if let Err(error) = handle_server_request(&state, &http, request).await {
+                            error!(%error, "server request handling failed");
+                        }
+                    });
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     // A dropped server request leaves Codex waiting on an
@@ -5858,6 +5880,10 @@ async fn handle_server_request(
     http: &Http,
     request: ServerRequest,
 ) -> Result<()> {
+    if let Some(reply) = state.host_broker.handle_request(&request).await {
+        send_server_reply(&state.codex, reply).await?;
+        return Ok(());
+    }
     if let Some(reply) = requests::immediate_reply(&request, Utc::now().timestamp()) {
         send_server_reply(&state.codex, reply).await?;
         return Ok(());

@@ -53,11 +53,13 @@ Relay explicitly classifies currently known server-initiated requests:
 | Disposition | Methods |
 |---|---|
 | Interactive Discord workflow | command approval, file-change approval, permission approval, legacy exec/patch approval, user input, MCP elicitation |
-| Host handled | current time read |
-| Negotiated off | ChatGPT token refresh, device attestation, dynamic client-side tool execution |
+| Host handled | current time read; allowlisted `codex_app` dynamic tools |
+| Negotiated off | ChatGPT token refresh, device attestation |
 
-Negotiated-off capabilities are deliberately not advertised. If a peer sends one despite
-negotiation, Relay fails closed rather than fabricating a response.
+Relay-created tasks advertise the read-only `codex_app.list_threads` and `codex_app.read_thread`
+tools through `thread/start.dynamicTools`. Unknown namespaces and tools fail closed. Other
+negotiated-off capabilities are not advertised; if a peer sends one anyway, Relay rejects it
+rather than fabricating a response.
 
 Server-request classification coverage does not make its delivery queue durable. A lagged bounded
 receiver can drop a pending approval and leave a turn waiting. Relay logs and audits this condition;
@@ -88,6 +90,7 @@ least:
 | Existing task | `/tasks` reopens active and archived tasks |
 | Turn | Text and attachment reach Codex; final answer returns |
 | Approval | Allow/deny response resolves the exact pending RPC request |
+| Dynamic HostBroker | Real model tool call completes nested app-server RPC; cold resume and fork retain tools |
 | User input | Modal response resumes the waiting turn |
 | Lifecycle | Interrupt, fork, archive, rename, rollback, compact |
 | Recovery | Offline message replay and outbox delivery after restart |

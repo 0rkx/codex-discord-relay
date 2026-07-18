@@ -388,6 +388,29 @@ pub fn describe_item(item: &Value, completed: bool) -> Option<String> {
             };
             Some(format!("🔌 {server}.{tool} · {status}"))
         }
+        "dynamicToolCall" => {
+            let namespace = item
+                .get("namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("host");
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let status = if completed {
+                item.get("status").and_then(Value::as_str).unwrap_or("done")
+            } else {
+                "running"
+            };
+            let icon = if completed && item.get("success").and_then(Value::as_bool) == Some(false) {
+                "❌"
+            } else {
+                "🧰"
+            };
+            let duration = item
+                .get("durationMs")
+                .and_then(Value::as_i64)
+                .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
+                .unwrap_or_default();
+            Some(format!("{icon} {namespace}.{tool} · {status}{duration}"))
+        }
         "webSearch" => {
             if !completed {
                 return None;
@@ -569,6 +592,19 @@ mod tests {
                 .unwrap()
                 .contains("github.search")
         );
+
+        let dynamic = json!({
+            "type": "dynamicToolCall",
+            "namespace": "codex_app",
+            "tool": "read_thread",
+            "status": "completed",
+            "success": true,
+            "durationMs": 1250
+        });
+        let line = describe_item(&dynamic, true).unwrap();
+        assert!(line.contains("codex_app.read_thread"));
+        assert!(line.contains("completed"));
+        assert!(line.contains("1.2s"));
 
         // Kinds carried by other surfaces stay out of the digest.
         assert!(describe_item(&json!({"type": "agentMessage", "text": "hi"}), true).is_none());

@@ -76,6 +76,11 @@ an opaque, owner-bound selection token; selecting a plugin reads live detail wit
 paths. Install and uninstall reuse Relay's typed GOD confirmation flow. Successful installs render
 Codex-provided app authentication URLs as link buttons when authentication remains necessary.
 
+Relay-created tasks also expose a native Rust `codex_app` namespace to the Codex model. Its
+read-only `list_threads` and `read_thread` tools let an agent inspect asynchronous task state without
+leaving Discord. Activity embeds show the namespace, tool, status, and duration instead of a generic
+item label.
+
 `/advanced` is task-bound, requires active GOD mode, validates JSON against the installed schema,
 and exists for developer recovery—not routine use.
 

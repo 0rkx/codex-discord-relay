@@ -1,7 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -102,8 +103,30 @@ fn redact_secret_value(value: &Value, parent_key: Option<&str>) -> Value {
                 .map(|value| redact_secret_value(value, parent_key))
                 .collect(),
         ),
+        Value::String(text) => Value::String(redact_secret_text(text)),
         other => other.clone(),
     }
+}
+
+fn redact_secret_text(text: &str) -> String {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"(?i)\bsk-[A-Za-z0-9_-]{20,}\b",
+            r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
+            r"\bAKIA[0-9A-Z]{16}\b",
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            r"\b[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}\b",
+            r"(?i)\bBearer\s+[A-Za-z0-9._~-]{20,}",
+            r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        ]
+        .into_iter()
+        .map(|pattern| Regex::new(pattern).expect("built-in secret regex must compile"))
+        .collect()
+    });
+    patterns.iter().fold(text.to_owned(), |value, pattern| {
+        pattern.replace_all(&value, "[REDACTED]").into_owned()
+    })
 }
 
 fn redact_audit_value(value: Value, parent_key: Option<&str>) -> Value {
@@ -137,7 +160,7 @@ fn redact_audit_value(value: Value, parent_key: Option<&str>) -> Value {
 fn is_secret_key(key: &str) -> bool {
     let key: String = key
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect();
     [
@@ -198,5 +221,30 @@ mod tests {
             let clean = redact_secrets(&json!({(key): "secret"}));
             assert_eq!(clean[key], "[REDACTED]", "variant {key}");
         }
+    }
+
+    #[test]
+    fn redacts_secret_shapes_inside_untrusted_output_strings() {
+        let openai = format!("sk-{}", "A".repeat(32));
+        let github = format!("ghp_{}", "B".repeat(36));
+        let aws = format!("AKIA{}", "C".repeat(16));
+        let jwt = format!(
+            "eyJ{}.{}.{}",
+            "d".repeat(20),
+            "e".repeat(20),
+            "f".repeat(20)
+        );
+        let discord = format!("{}.{}.{}", "1".repeat(18), "G".repeat(6), "h".repeat(30));
+        let text = format!(
+            "safe {openai} {github} {aws} {jwt} {discord} -----BEGIN PRIVATE KEY-----\nmaterial\n-----END PRIVATE KEY-----"
+        );
+        let clean = redact_secrets(&json!({"output": text}));
+        let output = clean["output"].as_str().unwrap();
+        assert!(output.starts_with("safe "));
+        assert_eq!(output.matches("[REDACTED]").count(), 6);
+        for secret in [openai, github, aws, jwt, discord] {
+            assert!(!output.contains(&secret));
+        }
+        assert!(!output.contains("PRIVATE KEY"));
     }
 }

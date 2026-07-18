@@ -41,6 +41,9 @@ Public documentation:
 - `/find` full-text search across every Codex task with snippets; results open directly into
   private task channels
 - `/mcp` searches and paginates the complete MCP server, tool, resource, and resource-template catalogs
+- Relay-created tasks register a native Rust `codex_app` HostBroker. Codex can list and read tasks
+  asynchronously through real `dynamicTools` calls; calls are turn-bound, allowlisted, redacted,
+  timeout-limited, and rendered in the activity embed
 - `/email` opens a native modal, attaches Gmail explicitly, and carries installation,
   authorization, approval, and send results through the Codex connector flow
 - Typed command/file/permission approvals plus question-specific user-input and MCP elicitation

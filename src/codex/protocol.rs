@@ -139,8 +139,52 @@ pub struct ThreadStartParams {
     pub developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_workspace_roots: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum DynamicToolSpec {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        description: String,
+        #[serde(rename = "inputSchema")]
+        input_schema: Value,
+        #[serde(
+            rename = "deferLoading",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        defer_loading: Option<bool>,
+    },
+    #[serde(rename = "namespace")]
+    Namespace {
+        name: String,
+        description: String,
+        tools: Vec<DynamicToolNamespaceTool>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum DynamicToolNamespaceTool {
+    #[serde(rename = "function")]
+    Function {
+        name: String,
+        description: String,
+        #[serde(rename = "inputSchema")]
+        input_schema: Value,
+        #[serde(
+            rename = "deferLoading",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        defer_loading: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -545,6 +589,38 @@ mod tests {
         assert_eq!(value["threadId"], "thread-1");
         assert_eq!(value["expectedTurnId"], "turn-1");
         assert_eq!(value["input"][0]["type"], "text");
+    }
+
+    #[test]
+    fn thread_start_dynamic_tools_match_installed_v2_schema() {
+        let params = ThreadStartParams {
+            dynamic_tools: Some(vec![DynamicToolSpec::Namespace {
+                name: "codex_app".to_owned(),
+                description: "Host tools".to_owned(),
+                tools: vec![DynamicToolNamespaceTool::Function {
+                    name: "list_threads".to_owned(),
+                    description: "List tasks".to_owned(),
+                    input_schema: json!({"type":"object","additionalProperties":false}),
+                    defer_loading: Some(false),
+                }],
+            }]),
+            ..ThreadStartParams::default()
+        };
+        assert_eq!(
+            serde_json::to_value(params).unwrap()["dynamicTools"][0],
+            json!({
+                "type": "namespace",
+                "name": "codex_app",
+                "description": "Host tools",
+                "tools": [{
+                    "type": "function",
+                    "name": "list_threads",
+                    "description": "List tasks",
+                    "inputSchema": {"type":"object","additionalProperties":false},
+                    "deferLoading": false
+                }]
+            })
+        );
     }
 
     #[test]

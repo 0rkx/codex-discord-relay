@@ -109,6 +109,9 @@ Windows account controls if local data confidentiality matters.
 - Missing/invalid config, owner mismatch, wrong guild, public channel, missing GOD hash, invalid
   schema parameters, or absent installed method rejects the action.
 - Unadvertised server capabilities are negotiated off and rejected if a peer sends them anyway.
+- Dynamic HostBroker calls require an exact `codex_app` namespace/tool allowlist and a matching
+  Relay task plus active turn. Arguments, time, concurrency, returned fields, secrets, and output
+  size are bounded; the first exposed tools are read-only.
 - A failed post-GOD normalization keeps the task quarantined and retries cleanup.
 - A poison Discord delivery dead-letters after ten attempts and becomes visible in runner status.
 

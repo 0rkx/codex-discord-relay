@@ -39,7 +39,8 @@ pub enum ServerRequestMethod {
 /// How each server-initiated request is handled by this host.
 ///
 /// `NegotiatedOff` methods are deliberately absent from the initialize
-/// capability advertisement. Receiving one is a protocol violation and gets
+/// capability advertisement. Dynamic tools are registered per thread instead
+/// and routed through the Rust `HostBroker`. Any remaining disabled method gets
 /// a fail-closed `-32601` response without echoing its parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerRequestDisposition {
@@ -78,8 +79,8 @@ impl ServerRequestMethod {
             | Self::PermissionsApproval
             | Self::LegacyApplyPatchApproval
             | Self::LegacyExecCommandApproval => ServerRequestDisposition::Interactive,
-            Self::CurrentTimeRead => ServerRequestDisposition::HostHandled,
-            Self::DynamicToolCall | Self::ChatgptAuthTokensRefresh | Self::AttestationGenerate => {
+            Self::CurrentTimeRead | Self::DynamicToolCall => ServerRequestDisposition::HostHandled,
+            Self::ChatgptAuthTokensRefresh | Self::AttestationGenerate => {
                 ServerRequestDisposition::NegotiatedOff
             }
             Self::Unknown => ServerRequestDisposition::Unknown,
@@ -292,8 +293,7 @@ pub fn unsupported_reply(request: &ServerRequest) -> ServerReply {
 pub fn immediate_reply(request: &ServerRequest, unix_seconds: i64) -> Option<ServerReply> {
     match ServerRequestMethod::classify(&request.method) {
         ServerRequestMethod::CurrentTimeRead => current_time_reply(request, unix_seconds).ok(),
-        ServerRequestMethod::DynamicToolCall
-        | ServerRequestMethod::ChatgptAuthTokensRefresh
+        ServerRequestMethod::ChatgptAuthTokensRefresh
         | ServerRequestMethod::AttestationGenerate
         | ServerRequestMethod::Unknown => Some(unsupported_reply(request)),
         _ => None,
@@ -342,7 +342,7 @@ mod tests {
                 ServerRequestDisposition::Unknown => panic!("{method} has no disposition"),
             }
         }
-        assert_eq!((interactive, host_handled, negotiated_off), (7, 1, 3));
+        assert_eq!((interactive, host_handled, negotiated_off), (7, 2, 2));
 
         let advertised = crate::codex::advertised_client_capabilities();
         let serialized = advertised.to_string().to_ascii_lowercase();
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn unsupported_error_is_safe_and_preserves_string_id() {
-        let reply = unsupported_reply(&request(json!("rpc-id"), "item/tool/call"));
+        let reply = unsupported_reply(&request(json!("rpc-id"), "unknown/serverRequest"));
         let ServerReply::Error { id, error } = reply else {
             panic!("expected error reply")
         };

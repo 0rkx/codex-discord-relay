@@ -13,10 +13,6 @@ pub const EXCLUDED_SERVER_REQUESTS: &[(&str, &str)] = &[
         "attestation/generate",
         "requires local OS/hardware attestation material unavailable to the relay",
     ),
-    (
-        "item/tool/call",
-        "dynamic client-side tool execution is not advertised by this host",
-    ),
 ];
 
 const INTERACTIVE_SERVER_REQUESTS: &[&str] = &[
@@ -28,7 +24,7 @@ const INTERACTIVE_SERVER_REQUESTS: &[&str] = &[
     "item/tool/requestUserInput",
     "mcpServer/elicitation/request",
 ];
-const HOST_SERVER_REQUESTS: &[&str] = &["currentTime/read"];
+const HOST_SERVER_REQUESTS: &[&str] = &["currentTime/read", "item/tool/call"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientDimension {
