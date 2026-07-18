@@ -280,6 +280,18 @@ pub fn answer_buttons(request_id: &str) -> Vec<CreateActionRow> {
     ])]
 }
 
+#[must_use]
+pub fn elicitation_confirmation_buttons(request_id: &str) -> Vec<CreateActionRow> {
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(format!("{APPROVE_ONCE}:{request_id}"))
+            .label("Accept")
+            .style(ButtonStyle::Success),
+        CreateButton::new(format!("{DENY}:{request_id}"))
+            .label("Decline")
+            .style(ButtonStyle::Danger),
+    ])]
+}
+
 pub const OPEN_TASK: &str = "relay:open_task";
 pub const OPEN_TASK_ARCHIVED: &str = "relay:open_task_archived";
 

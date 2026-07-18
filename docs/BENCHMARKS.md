@@ -7,20 +7,20 @@ localhost HTTP bridge.
 ## Current Windows sample
 
 Measured 2026-07-18 on Windows x64. Exact deployed release SHA-256:
-`0AFA3A4A3594060C5F81F38095F13256D40B66FE10370276D59C819729F8EA10`.
+`5D4A72CD54AE0BB51E0DB055EC74C5C1BEE93452466DCC0A245C7AB18820AEF6`.
 
 | Metric | Result |
 | --- | ---: |
-| Release executable | 13.18 MiB |
-| Relay settled working set | 33.72 MiB |
-| Relay settled private memory | 16.06 MiB |
-| Codex companion settled working set | 46.39 MiB |
-| Codex companion settled private memory | 20.85 MiB |
-| Relay + companion working set | 80.11 MiB |
-| Relay + companion private memory | 36.91 MiB |
+| Release executable | 13.22 MiB |
+| Relay settled working set | 30.80 MiB |
+| Relay settled private memory | 13.96 MiB |
+| Codex companion settled working set | 48.46 MiB |
+| Codex companion settled private memory | 20.74 MiB |
+| Relay + companion working set | 79.26 MiB |
+| Relay + companion private memory | 34.71 MiB |
 | Relay CPU over a ten-second idle sample | 0.000% of one core |
 
-Windows also created a console host using 10.14 MiB working set and 1.62 MiB private memory.
+Windows also created a console host using 10.15 MiB working set and 1.62 MiB private memory.
 Active Discord cache entries, attachments, task output, SQLite pages, Codex tools, and conversation
 context can raise memory use.
 

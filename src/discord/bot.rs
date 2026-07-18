@@ -61,6 +61,10 @@ use crate::{
     state::StateStore,
 };
 
+const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+const RELAY_DEFAULT_REASONING_EFFORT: &str = "medium";
+const RELAY_DEVELOPER_INSTRUCTIONS: &str = "Work as the installed Codex agent, not as a chat-only assistant. Inspect available apps, plugins, MCP servers, and tools before claiming a capability is unavailable. For current or public facts, search the web and open an authoritative source before concluding. Continue through relevant tool calls and verification until the requested outcome is complete or a genuine user/auth/external blocker remains. Never fabricate tool use, connector success, citations, or external actions.";
+
 #[derive(Default)]
 struct StreamBuffer {
     segments: Vec<StreamSegment>,
@@ -931,13 +935,13 @@ impl Handler {
             .codex
             .thread_start(ThreadStartParams {
                 cwd: cwd.clone(),
-                model: None,
+                model: Some(RELAY_DEFAULT_MODEL.to_owned()),
                 approval_policy: Some(CodexExecutionPolicy::NORMAL.approval_policy.into()),
                 sandbox: Some(CodexExecutionPolicy::NORMAL.thread_sandbox()),
                 personality: None,
-                developer_instructions: None,
+                developer_instructions: Some(RELAY_DEVELOPER_INSTRUCTIONS.to_owned()),
                 runtime_workspace_roots: cwd.clone().map(|path| vec![path]),
-                extra: BTreeMap::new(),
+                extra: BTreeMap::from([("config".to_owned(), json!({"web_search": "live"}))]),
             })
             .await?;
         let thread_id = thread
@@ -945,6 +949,14 @@ impl Handler {
             .and_then(Value::as_str)
             .context("Codex thread/start response missing thread.id")?
             .to_owned();
+        self.state
+            .codex
+            .thread_settings_update(ThreadSettingsUpdateParams {
+                thread_id: thread_id.clone(),
+                effort: Some(RELAY_DEFAULT_REASONING_EFFORT.to_owned()),
+                collaboration_mode: None,
+            })
+            .await?;
         let layout = self
             .state
             .layout
@@ -969,7 +981,7 @@ impl Handler {
             cwd: cwd.clone(),
             state: TaskState::Running,
             turn_id: None,
-            model: None,
+            model: Some(RELAY_DEFAULT_MODEL.to_owned()),
             last_event_at: Some(Utc::now()),
         };
         self.state.store.upsert_task(&task).await?;
@@ -992,7 +1004,7 @@ impl Handler {
                 thread_id.clone(),
                 vec![UserInput::text(prompt)],
                 cwd,
-                None,
+                Some(RELAY_DEFAULT_MODEL.to_owned()),
             ))
             .await?;
         task.turn_id = turn
@@ -1206,13 +1218,24 @@ impl Handler {
         );
         defer_modal(http, modal).await?;
         let mut task = self.task_for_channel(modal.channel_id).await?;
+        let gmail_mention = collect_apps(&self.state.codex, Some(task.thread_id.clone()), true)
+            .await?
+            .into_iter()
+            .find(|app| {
+                app.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("gmail"))
+            })
+            .and_then(|app| app.get("id").and_then(Value::as_str).map(str::to_owned))
+            .map(|id| format!("[$Gmail](app://{id})\n"))
+            .unwrap_or_default();
         let cc_line = if cc.is_empty() {
             String::new()
         } else {
             format!("\nCc: {cc}")
         };
         let prompt = format!(
-            "Use the configured email connector to send this email. If no connector is configured, explain the exact setup needed and do not pretend it was sent.\nTo: {to}{cc_line}\nSubject: {subject}\n\n{body}"
+            "{gmail_mention}Use the Gmail connector to send this email. If Gmail needs installation, authorization, or confirmation, request it through the connector flow and continue after approval. Do not claim success without a successful connector result.\nTo: {to}{cc_line}\nSubject: {subject}\n\n{body}"
         );
         let security_context = self
             .security_context(http, modal.user.id.get(), modal.guild_id, modal.channel_id)
@@ -2201,7 +2224,17 @@ impl Handler {
                 )?
             }
             ServerRequestMethod::McpElicitation => {
-                requests::mcp_elicitation_reply(&request, McpElicitationAction::Decline, None)?
+                if decision == "decline" {
+                    requests::mcp_elicitation_reply(&request, McpElicitationAction::Decline, None)?
+                } else if mcp_elicitation_has_empty_form_schema(&request) {
+                    requests::mcp_elicitation_reply(
+                        &request,
+                        McpElicitationAction::Accept,
+                        Some(json!({})),
+                    )?
+                } else {
+                    anyhow::bail!("MCP form requires an answer before it can be accepted")
+                }
             }
             ServerRequestMethod::ToolUserInput => ServerReply::Error {
                 id: request.id.clone(),
@@ -2760,22 +2793,42 @@ impl Handler {
 
     async fn apps(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
         defer_command(http, command).await?;
+        let query = string_command_option(command, "query")
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_ascii_lowercase);
         let thread_id = self
             .state
             .store
             .task_by_channel(command.channel_id.get())
             .await?
             .map(|task| task.thread_id);
-        let result = self
-            .state
-            .codex
-            .app_list(AppListParams {
-                limit: Some(50),
-                thread_id,
-                ..Default::default()
-            })
-            .await?;
-        let apps = first_result_array(&result, &["data", "apps", "items"]);
+        let mut apps = collect_apps(&self.state.codex, thread_id, true).await?;
+        if let Some(query) = query.as_deref() {
+            apps.retain(|app| {
+                app.get("name")
+                    .or_else(|| app.get("id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(query))
+            });
+        }
+        apps.sort_by_key(|app| {
+            let accessible = app
+                .get("isAccessible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let enabled = app
+                .get("isEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let name = app
+                .get("name")
+                .or_else(|| app.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            (!accessible, !enabled, name)
+        });
         let mut lines = String::new();
         for app in apps.iter().take(25) {
             let name = app
@@ -2783,11 +2836,21 @@ impl Handler {
                 .or_else(|| app.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or("unnamed");
-            let status = app
-                .get("status")
-                .or_else(|| app.get("connectionStatus"))
-                .and_then(Value::as_str)
-                .unwrap_or("available");
+            let enabled = app
+                .get("isEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let accessible = app
+                .get("isAccessible")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let status = if !enabled {
+                "disabled"
+            } else if accessible {
+                "connected"
+            } else {
+                "not connected"
+            };
             lines.push_str(&format!("**{name}** · {status}\n"));
         }
         if lines.is_empty() {
@@ -4002,7 +4065,16 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
             ),
         CommandBuilder::new("model").description("Choose the model for new turns in this task"),
         CommandBuilder::new("skills").description("List skills available to this task"),
-        CommandBuilder::new("apps").description("List Codex apps and connectors"),
+        CommandBuilder::new("apps")
+            .description("List Codex apps and connectors")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "query",
+                    "Filter by app or connector name",
+                )
+                .required(false),
+            ),
         CommandBuilder::new("config").description("Show effective Codex config, redacted"),
         CommandBuilder::new("account").description("Show Codex account status, redacted"),
         CommandBuilder::new("usage").description("Show Codex usage and rate limits"),
@@ -4099,6 +4171,7 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                     .add_string_choice("Medium", "medium")
                     .add_string_choice("High", "high")
                     .add_string_choice("Extra high", "xhigh")
+                    .add_string_choice("Maximum", "max")
                     .required(true),
             ),
         CommandBuilder::new("files")
@@ -5348,6 +5421,9 @@ async fn handle_server_request(
         warn!(thread_id, %error, "task summary could not be refreshed; delivering approval card anyway");
     }
     let controls = match ServerRequestMethod::classify(&request.method) {
+        ServerRequestMethod::McpElicitation if mcp_elicitation_has_empty_form_schema(&request) => {
+            components::elicitation_confirmation_buttons(&request_id)
+        }
         ServerRequestMethod::ToolUserInput | ServerRequestMethod::McpElicitation => {
             components::answer_buttons(&request_id)
         }
@@ -6086,6 +6162,43 @@ fn boolean_command_option(command: &CommandInteraction, name: &str) -> Option<bo
     })
 }
 
+async fn collect_apps(
+    client: &CodexClient,
+    thread_id: Option<String>,
+    force_refetch: bool,
+) -> Result<Vec<Value>> {
+    const PAGE_SIZE: u32 = 100;
+    const MAX_PAGES: usize = 100;
+
+    let mut apps = Vec::new();
+    let mut cursor = None;
+    for page in 0..MAX_PAGES {
+        let result = client
+            .app_list(AppListParams {
+                cursor: cursor.clone(),
+                limit: Some(PAGE_SIZE),
+                thread_id: thread_id.clone(),
+                force_refetch: Some(force_refetch && page == 0),
+            })
+            .await?;
+        apps.extend(
+            first_result_array(&result, &["data", "apps", "items"])
+                .iter()
+                .cloned(),
+        );
+        let next = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if next.is_none() {
+            return Ok(apps);
+        }
+        anyhow::ensure!(next != cursor, "Codex app/list returned a repeated cursor");
+        cursor = next;
+    }
+    anyhow::bail!("Codex app/list exceeded {MAX_PAGES} pages")
+}
+
 fn first_result_array<'a>(value: &'a Value, keys: &[&str]) -> &'a [Value] {
     for key in keys {
         if let Some(values) = value.get(*key).and_then(Value::as_array) {
@@ -6192,18 +6305,16 @@ fn server_answer_form(request: &ServerRequest) -> Result<Vec<serenity::builder::
             let properties = schema
                 .and_then(|schema| schema.get("properties"))
                 .and_then(Value::as_object);
-            let Some(properties) = properties else {
+            let Some(properties) =
+                properties.filter(|properties| (1..=5).contains(&properties.len()))
+            else {
                 return Ok(components::server_answer_inputs([(
                     "m:free".to_owned(),
                     "Form values".to_owned(),
-                    "One key=value pair per line".to_owned(),
+                    "JSON object or one key=value pair per line".to_owned(),
                     true,
                 )]));
             };
-            anyhow::ensure!(
-                (1..=5).contains(&properties.len()),
-                "Discord supports at most five MCP form fields"
-            );
             let required = schema
                 .and_then(|schema| schema.get("required"))
                 .and_then(Value::as_array)
@@ -6250,6 +6361,17 @@ fn server_answer_form(request: &ServerRequest) -> Result<Vec<serenity::builder::
         }
         _ => anyhow::bail!("this request does not accept typed input"),
     }
+}
+
+fn mcp_elicitation_has_empty_form_schema(request: &ServerRequest) -> bool {
+    ServerRequestMethod::classify(&request.method) == ServerRequestMethod::McpElicitation
+        && request.params.get("mode").and_then(Value::as_str) != Some("url")
+        && request
+            .params
+            .get("requestedSchema")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
 }
 
 fn parse_user_input_modal_answers(
@@ -6301,11 +6423,12 @@ fn parse_user_input_modal_answers(
 }
 
 fn parse_mcp_modal_content(request: &ServerRequest, modal: &ModalInteraction) -> Result<Value> {
-    let Some(properties) = request
+    let properties = request
         .params
         .get("requestedSchema")
         .and_then(|schema| schema.get("properties"))
-        .and_then(Value::as_object)
+        .and_then(Value::as_object);
+    let Some(properties) = properties.filter(|properties| (1..=5).contains(&properties.len()))
     else {
         let raw = modal_value(modal, "m:free").context("MCP form values missing")?;
         return actions::parse_free_form_object(raw);
@@ -6815,7 +6938,9 @@ mod server_request_setup_tests {
     use serde_json::json;
 
     use super::{
-        ServerReply, ServerRequest, ServerRequestSetupFailure, server_request_setup_failure_reply,
+        ServerReply, ServerRequest, ServerRequestSetupFailure,
+        mcp_elicitation_has_empty_form_schema, server_answer_form,
+        server_request_setup_failure_reply,
     };
 
     fn request(id: serde_json::Value) -> ServerRequest {
@@ -6863,6 +6988,73 @@ mod server_request_setup_tests {
             ServerRequestSetupFailure::PendingSave.message(),
             "could not persist the pending Codex request"
         );
+    }
+
+    #[test]
+    fn six_field_mcp_schema_uses_one_lossless_free_form_input() {
+        let request = ServerRequest {
+            id: json!("mcp-six"),
+            method: "mcpServer/elicitation/request".to_owned(),
+            params: json!({
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "one": {"type": "string"},
+                        "two": {"type": "string"},
+                        "three": {"type": "string"},
+                        "four": {"type": "string"},
+                        "five": {"type": "string"},
+                        "six": {"type": "string"}
+                    }
+                }
+            }),
+        };
+
+        let rows = server_answer_form(&request)
+            .expect("large MCP schemas must use one free-form Discord input");
+        let payload = serde_json::to_value(rows).unwrap();
+
+        assert_eq!(payload.as_array().unwrap().len(), 1);
+        assert_eq!(payload[0]["components"][0]["custom_id"], "m:free");
+    }
+
+    #[test]
+    fn five_field_mcp_schema_keeps_typed_discord_inputs() {
+        let request = ServerRequest {
+            id: json!("mcp-five"),
+            method: "mcpServer/elicitation/request".to_owned(),
+            params: json!({
+                "mode": "form",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "one": {"type": "string"},
+                        "two": {"type": "string"},
+                        "three": {"type": "string"},
+                        "four": {"type": "string"},
+                        "five": {"type": "string"}
+                    }
+                }
+            }),
+        };
+
+        let payload = serde_json::to_value(server_answer_form(&request).unwrap()).unwrap();
+        assert_eq!(payload.as_array().unwrap().len(), 5);
+        assert_eq!(payload[4]["components"][0]["custom_id"], "m:4");
+    }
+
+    #[test]
+    fn empty_mcp_form_schema_is_direct_confirmation() {
+        let request = ServerRequest {
+            id: json!("gmail-install"),
+            method: "mcpServer/elicitation/request".to_owned(),
+            params: json!({
+                "mode": "form",
+                "requestedSchema": {"type": "object", "properties": {}}
+            }),
+        };
+
+        assert!(mcp_elicitation_has_empty_form_schema(&request));
     }
 }
 

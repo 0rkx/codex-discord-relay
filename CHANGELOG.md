@@ -5,14 +5,23 @@ stable public API is declared.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-18
+
 ### Added
 
 - Public architecture, Discord UX, setup, security, coverage, contribution, and release guides.
+- New Relay tasks use GPT-5.6 Sol, medium reasoning, live web search, and a compact verification
+  contract while preserving Codex as the underlying agent runtime.
+- `/apps` paginates the Codex catalog, supports name filtering, and reports actual connector access.
 
 ### Fixed
 
 - Replaced the Fork button's non-emoji symbol with a valid Unicode emoji so Discord accepts task
   control payloads.
+- Empty MCP connector-install forms now use direct Accept/Decline controls, while forms above
+  Discord's five-input limit use one lossless JSON or key-value field.
+- `/email` explicitly attaches the discovered Gmail connector so Codex can run its installation,
+  authorization, approval, and send workflow.
 
 ## [0.1.0] - 2026-07-18
 

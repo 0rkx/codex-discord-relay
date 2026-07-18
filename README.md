@@ -31,15 +31,21 @@ Public documentation:
   it in Codex first so new turns are accepted again
 - Dedicated `/model`, `/review`, `/compact`, `/rollback`, `/rename`, `/skills`, `/apps`,
   `/config`, `/account`, `/usage`, and `/capabilities` commands backed by typed Rust helpers
+- `/apps` reads the complete paginated catalog, accepts an optional name filter, and distinguishes
+  connected, not-connected, and disabled integrations from Codex's real accessibility fields
 - Task productivity commands: `/goal` (objective/budget tracking), `/history` (recent turn
   digest), `/terminals` (list/terminate/clean background terminals), `/files` (fuzzy workspace
   file search), `/mode` (collaboration presets), and `/effort` (reasoning effort for new turns)
 - `/find` full-text search across every Codex task with snippets; results open directly into
   private task channels
 - `/mcp` shows configured MCP servers with auth state and tool counts
-- `/email` opens a native modal and sends through the installed email connector, including any
-  provider authorization handoff required by Codex
-- Typed command/file/permission approvals plus question-specific user-input and MCP elicitation modals
+- `/email` opens a native modal, attaches Gmail explicitly, and carries installation,
+  authorization, approval, and send results through the Codex connector flow
+- Typed command/file/permission approvals plus question-specific user-input and MCP elicitation
+  controls; empty consent forms use direct buttons and large forms use lossless JSON/key-value input
+- New tasks default to GPT-5.6 Sol, medium reasoning, and live web search, with instructions to
+  verify sources and external actions before reporting completion; `/model` and `/effort` expose
+  per-task controls through Discord
 - Discord attachments are cached locally before dispatch so asynchronous replay never depends on expiring CDN URLs
 - Paged offline message catch-up after Windows runner restarts; ingestion marked with ✅
 - Audited `/advanced` raw RPC remains only as a privileged developer escape hatch
@@ -190,11 +196,11 @@ codex-discord.exe doctor --deep
 One Windows release-build sample taken from the exact deployed binary on 2026-07-18 after a
 15-second idle settle and a ten-second CPU sample:
 
-- Optimized Rust binary: 13.18 MiB on disk
-- Rust Discord relay: 33.72 MiB working set, 16.06 MiB private memory, 0.000% one-core CPU
-- Codex Desktop companion child: 46.39 MiB working set, 20.85 MiB private memory
-- Relay + companion: 80.11 MiB working set, 36.91 MiB private memory
-- Windows console host: an additional 10.14 MiB working set and 1.62 MiB private memory
+- Optimized Rust binary: 13.22 MiB on disk
+- Rust Discord relay: 30.80 MiB working set, 13.96 MiB private memory, 0.000% one-core CPU
+- Codex Desktop companion child: 48.46 MiB working set, 20.74 MiB private memory
+- Relay + companion: 79.26 MiB working set, 34.71 MiB private memory
+- Windows console host: an additional 10.15 MiB working set and 1.62 MiB private memory
 
 Active turns, attachments, Discord cache size, and Codex Desktop updates can change resource use.
 See [performance](docs/BENCHMARKS.md) for machine details, executable hash, and methodology.
