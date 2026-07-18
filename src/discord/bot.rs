@@ -633,14 +633,42 @@ impl Handler {
         };
         let needle = focused.value.to_ascii_lowercase();
         let mut response = CreateAutocompleteResponse::new();
-        for method in self
-            .state
-            .client_methods
-            .iter()
-            .filter(|method| method.to_ascii_lowercase().contains(&needle))
-            .take(25)
-        {
-            response = response.add_string_choice(method, method);
+        if command.data.name == "effort" {
+            let model = self
+                .state
+                .store
+                .task_by_channel(command.channel_id.get())
+                .await?
+                .and_then(|task| task.model)
+                .unwrap_or_else(|| RELAY_DEFAULT_MODEL.to_owned());
+            if let Ok(Ok(result)) = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.state.codex.model_list(ModelListParams {
+                    cursor: None,
+                    limit: Some(100),
+                    include_hidden: Some(true),
+                }),
+            )
+            .await
+            {
+                for effort in model_reasoning_efforts(&result, &model)
+                    .into_iter()
+                    .filter(|effort| effort.to_ascii_lowercase().contains(&needle))
+                    .take(25)
+                {
+                    response = response.add_string_choice(&effort, effort.clone());
+                }
+            }
+        } else {
+            for method in self
+                .state
+                .client_methods
+                .iter()
+                .filter(|method| method.to_ascii_lowercase().contains(&needle))
+                .take(25)
+            {
+                response = response.add_string_choice(method, method);
+            }
         }
         command
             .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
@@ -2226,6 +2254,10 @@ impl Handler {
             ServerRequestMethod::McpElicitation => {
                 if decision == "decline" {
                     requests::mcp_elicitation_reply(&request, McpElicitationAction::Decline, None)?
+                } else if decision == "cancel" {
+                    requests::mcp_elicitation_reply(&request, McpElicitationAction::Cancel, None)?
+                } else if request.params.get("mode").and_then(Value::as_str) == Some("url") {
+                    requests::mcp_elicitation_reply(&request, McpElicitationAction::Accept, None)?
                 } else if mcp_elicitation_has_empty_form_schema(&request) {
                     requests::mcp_elicitation_reply(
                         &request,
@@ -2275,7 +2307,7 @@ impl Handler {
                         CreateEmbed::new()
                             .title("Request resolved")
                             .description(format!("Decision: **{decision}**"))
-                            .color(if decision == "decline" {
+                            .color(if matches!(decision, "decline" | "cancel") {
                                 0xED4245
                             } else {
                                 0x57F287
@@ -2744,6 +2776,11 @@ impl Handler {
 
     async fn skills(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
         defer_command(http, command).await?;
+        let query = string_command_option(command, "query")
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_ascii_lowercase);
+        let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
         let cwd = self
             .state
             .store
@@ -2758,9 +2795,26 @@ impl Handler {
                 force_reload: None,
             })
             .await?;
-        let skills = first_result_array(&result, &["data", "skills", "items"]);
+        let mut skills = collect_skills(&result);
+        if let Some(query) = query.as_deref() {
+            skills.retain(|skill| {
+                ["name", "id", "description", "path"]
+                    .into_iter()
+                    .filter_map(|key| skill.get(key).and_then(Value::as_str))
+                    .any(|value| value.to_ascii_lowercase().contains(query))
+            });
+        }
+        skills.sort_by_key(|skill| {
+            skill
+                .get("name")
+                .or_else(|| skill.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        });
+        let (start, end, page, pages) = page_window(skills.len(), requested_page, 25);
         let mut lines = String::new();
-        for skill in skills.iter().take(25) {
+        for skill in &skills[start..end] {
             let name = skill
                 .get("name")
                 .or_else(|| skill.get("id"))
@@ -2781,7 +2835,10 @@ impl Handler {
         if lines.is_empty() {
             lines.push_str("No skills discovered.");
         }
-        push_more_indicator(&mut lines, skills.len(), 25);
+        lines.push_str(&format!(
+            "\n\nPage {page}/{pages} · {} skills",
+            skills.len()
+        ));
         command
             .edit_response(
                 http,
@@ -2797,6 +2854,7 @@ impl Handler {
             .map(str::trim)
             .filter(|query| !query.is_empty())
             .map(str::to_ascii_lowercase);
+        let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
         let thread_id = self
             .state
             .store
@@ -2829,8 +2887,9 @@ impl Handler {
                 .to_ascii_lowercase();
             (!accessible, !enabled, name)
         });
+        let (start, end, page, pages) = page_window(apps.len(), requested_page, 25);
         let mut lines = String::new();
-        for app in apps.iter().take(25) {
+        for app in &apps[start..end] {
             let name = app
                 .get("name")
                 .or_else(|| app.get("id"))
@@ -2856,7 +2915,7 @@ impl Handler {
         if lines.is_empty() {
             lines.push_str("No apps/connectors available.");
         }
-        push_more_indicator(&mut lines, apps.len(), 25);
+        lines.push_str(&format!("\n\nPage {page}/{pages} · {} apps", apps.len()));
         command
             .edit_response(
                 http,
@@ -3457,6 +3516,25 @@ impl Handler {
             .to_owned();
         defer_command(http, command).await?;
         let task = self.task_for_channel(command.channel_id).await?;
+        let model = task
+            .model
+            .clone()
+            .unwrap_or_else(|| RELAY_DEFAULT_MODEL.to_owned());
+        let result = self
+            .state
+            .codex
+            .model_list(ModelListParams {
+                cursor: None,
+                limit: Some(100),
+                include_hidden: Some(true),
+            })
+            .await?;
+        let supported = model_reasoning_efforts(&result, &model);
+        anyhow::ensure!(
+            supported.iter().any(|effort| effort == &level),
+            "`{level}` is not supported by `{model}`; choose one of: {}",
+            supported.join(", ")
+        );
         self.state
             .codex
             .thread_settings_update(ThreadSettingsUpdateParams {
@@ -4064,9 +4142,24 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                 .required(false),
             ),
         CommandBuilder::new("model").description("Choose the model for new turns in this task"),
-        CommandBuilder::new("skills").description("List skills available to this task"),
+        CommandBuilder::new("skills")
+            .description("Search every skill available to this task")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "query",
+                    "Filter by skill name or description",
+                )
+                .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::Integer, "page", "Result page")
+                    .min_int_value(1)
+                    .max_int_value(100)
+                    .required(false),
+            ),
         CommandBuilder::new("apps")
-            .description("List Codex apps and connectors")
+            .description("Search Codex apps and connectors")
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::String,
@@ -4074,6 +4167,12 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                     "Filter by app or connector name",
                 )
                 .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::Integer, "page", "Result page")
+                    .min_int_value(1)
+                    .max_int_value(100)
+                    .required(false),
             ),
         CommandBuilder::new("config").description("Show effective Codex config, redacted"),
         CommandBuilder::new("account").description("Show Codex account status, redacted"),
@@ -4166,12 +4265,7 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
             .description("Set reasoning effort for new turns in this task")
             .add_option(
                 CreateCommandOption::new(CommandOptionType::String, "level", "Reasoning effort")
-                    .add_string_choice("Minimal", "minimal")
-                    .add_string_choice("Low", "low")
-                    .add_string_choice("Medium", "medium")
-                    .add_string_choice("High", "high")
-                    .add_string_choice("Extra high", "xhigh")
-                    .add_string_choice("Maximum", "max")
+                    .set_autocomplete(true)
                     .required(true),
             ),
         CommandBuilder::new("files")
@@ -5421,6 +5515,14 @@ async fn handle_server_request(
         warn!(thread_id, %error, "task summary could not be refreshed; delivering approval card anyway");
     }
     let controls = match ServerRequestMethod::classify(&request.method) {
+        ServerRequestMethod::McpElicitation
+            if request.params.get("mode").and_then(Value::as_str) == Some("url") =>
+        {
+            components::elicitation_url_buttons(
+                &request_id,
+                request.params.get("url").and_then(Value::as_str),
+            )
+        }
         ServerRequestMethod::McpElicitation if mcp_elicitation_has_empty_form_schema(&request) => {
             components::elicitation_confirmation_buttons(&request_id)
         }
@@ -6208,6 +6310,64 @@ fn first_result_array<'a>(value: &'a Value, keys: &[&str]) -> &'a [Value] {
     &[]
 }
 
+/// `skills/list` groups entries by requested cwd in current Codex builds.
+/// Normalize the older flat response at the same boundary.
+fn collect_skills(value: &Value) -> Vec<Value> {
+    let direct = first_result_array(value, &["data", "skills", "items"]);
+    let grouped = direct
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .get("skills")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if grouped.is_empty() {
+        direct.to_vec()
+    } else {
+        grouped
+    }
+}
+
+fn page_window(
+    total: usize,
+    requested_page: usize,
+    page_size: usize,
+) -> (usize, usize, usize, usize) {
+    let pages = total.max(1).div_ceil(page_size);
+    let page = requested_page.clamp(1, pages);
+    let start = (page - 1) * page_size;
+    let end = (start + page_size).min(total);
+    (start, end, page, pages)
+}
+
+fn model_reasoning_efforts(value: &Value, model_id: &str) -> Vec<String> {
+    first_result_array(value, &["data", "models", "items"])
+        .iter()
+        .find(|model| {
+            model
+                .get("id")
+                .or_else(|| model.get("model"))
+                .and_then(Value::as_str)
+                == Some(model_id)
+        })
+        .and_then(|model| model.get("supportedReasoningEfforts"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            option
+                .get("reasoningEffort")
+                .and_then(Value::as_str)
+                .or_else(|| option.as_str())
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 fn modal_value<'a>(modal: &'a ModalInteraction, custom_id: &str) -> Option<&'a str> {
     modal
         .data
@@ -6227,6 +6387,7 @@ fn parse_approval_component(custom_id: &str) -> Option<(&'static str, &str)> {
     [
         (components::APPROVE_ONCE, "accept"),
         (components::APPROVE_SESSION, "acceptForSession"),
+        (components::CANCEL_REQUEST, "cancel"),
         (components::DENY, "decline"),
     ]
     .into_iter()
@@ -6262,18 +6423,26 @@ fn server_answer_form(request: &ServerRequest) -> Result<Vec<serenity::builder::
                 .and_then(Value::as_array)
                 .context("Codex input request has no questions")?;
             anyhow::ensure!(
-                (1..=5).contains(&questions.len()),
-                "Discord supports at most five questions per request"
+                !questions.is_empty(),
+                "Codex input request has no questions"
             );
+            anyhow::ensure!(
+                questions.iter().all(|question| !question
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)),
+                "secret input is blocked in Discord; answer from local Codex"
+            );
+            if questions.len() > 5 {
+                return Ok(components::server_answer_inputs([(
+                    "u:free".to_owned(),
+                    "Answers by question id".to_owned(),
+                    "JSON object or one question_id=value per line".to_owned(),
+                    true,
+                )]));
+            }
             let mut fields = Vec::with_capacity(questions.len());
             for (index, question) in questions.iter().enumerate() {
-                anyhow::ensure!(
-                    !question
-                        .get("isSecret")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    "secret input is blocked in Discord; answer from local Codex"
-                );
                 let label = question
                     .get("header")
                     .or_else(|| question.get("question"))
@@ -6301,6 +6470,10 @@ fn server_answer_form(request: &ServerRequest) -> Result<Vec<serenity::builder::
             Ok(components::server_answer_inputs(fields))
         }
         ServerRequestMethod::McpElicitation => {
+            anyhow::ensure!(
+                request.params.get("mode").and_then(Value::as_str) != Some("url"),
+                "URL connector requests use the link and completion buttons"
+            );
             let schema = request.params.get("requestedSchema");
             let properties = schema
                 .and_then(|schema| schema.get("properties"))
@@ -6383,6 +6556,37 @@ fn parse_user_input_modal_answers(
         .get("questions")
         .and_then(Value::as_array)
         .context("Codex input request has no questions")?;
+    if questions.len() > 5 {
+        let raw = modal_value(modal, "u:free").context("question answers missing")?;
+        let supplied = actions::parse_free_form_object(raw)?;
+        let supplied = supplied
+            .as_object()
+            .context("question answers must be a JSON object")?;
+        let mut answers = BTreeMap::new();
+        for (index, question) in questions.iter().enumerate() {
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .with_context(|| format!("question {index} has no id"))?;
+            let value = supplied
+                .get(id)
+                .with_context(|| format!("answer missing for {id}"))?;
+            let values = match value {
+                Value::Array(values) => values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned)
+                    })
+                    .collect(),
+                Value::String(value) => vec![value.clone()],
+                value => vec![value.to_string()],
+            };
+            answers.insert(id.to_owned(), validate_user_answer(question, id, values)?);
+        }
+        return Ok(answers);
+    }
     let mut answers = BTreeMap::new();
     for (index, question) in questions.iter().enumerate() {
         let id = question
@@ -6397,29 +6601,38 @@ fn parse_user_input_modal_answers(
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        anyhow::ensure!(!values.is_empty(), "answer for {id} is empty");
-        let allowed = question
-            .get("options")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|option| option.get("label").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        let allows_other = question
-            .get("isOther")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !allowed.is_empty() && !allows_other {
-            anyhow::ensure!(
-                values.iter().all(|value| allowed.contains(&value.as_str())),
-                "answer for {id} must be one of {}",
-                allowed.join(", ")
-            );
-        }
-        answers.insert(id.to_owned(), values);
+        answers.insert(id.to_owned(), validate_user_answer(question, id, values)?);
     }
     anyhow::ensure!(!answers.is_empty(), "at least one answer is required");
     Ok(answers)
+}
+
+fn validate_user_answer(question: &Value, id: &str, values: Vec<String>) -> Result<Vec<String>> {
+    let values = values
+        .into_iter()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!values.is_empty(), "answer for {id} is empty");
+    let allowed = question
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option.get("label").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let allows_other = question
+        .get("isOther")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !allowed.is_empty() && !allows_other {
+        anyhow::ensure!(
+            values.iter().all(|value| allowed.contains(&value.as_str())),
+            "answer for {id} must be one of {}",
+            allowed.join(", ")
+        );
+    }
+    Ok(values)
 }
 
 fn parse_mcp_modal_content(request: &ServerRequest, modal: &ModalInteraction) -> Result<Value> {
@@ -6930,6 +7143,53 @@ mod god_safety_tests {
             lifecycle.cleanup_lease("thread-9").is_some(),
             "dropping the lease must make a failed cleanup retryable"
         );
+    }
+}
+
+#[cfg(test)]
+mod capability_list_tests {
+    use serde_json::json;
+
+    use super::{collect_skills, model_reasoning_efforts, page_window};
+
+    #[test]
+    fn current_grouped_skills_response_is_flattened() {
+        let result = json!({
+            "data": [
+                {"cwd":"C:/one","skills":[{"name":"alpha"},{"name":"beta"}]},
+                {"cwd":"C:/two","skills":[{"name":"gamma"}]}
+            ]
+        });
+        let names = collect_skills(&result)
+            .into_iter()
+            .filter_map(|skill| skill["name"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn flat_legacy_skills_response_still_works() {
+        let result = json!({"skills":[{"name":"alpha"},{"name":"beta"}]});
+        assert_eq!(collect_skills(&result).len(), 2);
+    }
+
+    #[test]
+    fn pagination_clamps_without_slicing_past_the_end() {
+        assert_eq!(page_window(434, 99, 25), (425, 434, 18, 18));
+        assert_eq!(page_window(0, 1, 25), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn reasoning_efforts_come_from_the_selected_live_model() {
+        let result = json!({"data":[
+            {"id":"gpt-a","supportedReasoningEfforts":[
+                {"reasoningEffort":"low"},{"reasoningEffort":"medium"}
+            ]},
+            {"id":"gpt-b","supportedReasoningEfforts":[
+                {"reasoningEffort":"high"},{"reasoningEffort":"ultra"}
+            ]}
+        ]});
+        assert_eq!(model_reasoning_efforts(&result, "gpt-b"), ["high", "ultra"]);
     }
 }
 

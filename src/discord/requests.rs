@@ -156,6 +156,7 @@ pub struct PermissionGrant {
 pub enum McpElicitationAction {
     Accept,
     Decline,
+    Cancel,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -166,6 +167,8 @@ pub enum ReplyBuildError {
     AcceptedElicitationMissingContent,
     #[error("declined or cancelled MCP elicitation must not include content")]
     RejectedElicitationHasContent,
+    #[error("URL MCP elicitation responses must not include content")]
+    UrlElicitationHasContent,
 }
 
 pub fn approval_reply(
@@ -215,11 +218,15 @@ pub fn mcp_elicitation_reply(
     if ServerRequestMethod::classify(&request.method) != ServerRequestMethod::McpElicitation {
         return Err(wrong_method(request));
     }
-    match (action, content.as_ref()) {
-        (McpElicitationAction::Accept, None) => {
+    let url_mode = request.params.get("mode").and_then(Value::as_str) == Some("url");
+    match (url_mode, action, content.as_ref()) {
+        (false, McpElicitationAction::Accept, None) => {
             return Err(ReplyBuildError::AcceptedElicitationMissingContent);
         }
-        (McpElicitationAction::Decline, Some(_)) => {
+        (true, McpElicitationAction::Accept, Some(_)) => {
+            return Err(ReplyBuildError::UrlElicitationHasContent);
+        }
+        (_, McpElicitationAction::Decline | McpElicitationAction::Cancel, Some(_)) => {
             return Err(ReplyBuildError::RejectedElicitationHasContent);
         }
         _ => {}
@@ -406,14 +413,38 @@ mod tests {
 
     #[test]
     fn mcp_elicitation_enforces_action_content_contract() {
-        let request = request(json!("mcp-1"), "mcpServer/elicitation/request");
+        let form_request = request(json!("mcp-1"), "mcpServer/elicitation/request");
         assert_eq!(
-            mcp_elicitation_reply(&request, McpElicitationAction::Accept, None),
+            mcp_elicitation_reply(&form_request, McpElicitationAction::Accept, None),
             Err(ReplyBuildError::AcceptedElicitationMissingContent)
+        );
+        let mut url_request = request(json!("mcp-url"), "mcpServer/elicitation/request");
+        url_request.params = json!({"mode":"url","url":"https://example.test/consent"});
+        assert_eq!(
+            mcp_elicitation_reply(&url_request, McpElicitationAction::Accept, None).unwrap(),
+            ServerReply::Result {
+                id: json!("mcp-url"),
+                result: json!({"action":"accept"})
+            }
+        );
+        assert_eq!(
+            mcp_elicitation_reply(&url_request, McpElicitationAction::Cancel, None).unwrap(),
+            ServerReply::Result {
+                id: json!("mcp-url"),
+                result: json!({"action":"cancel"})
+            }
         );
         assert_eq!(
             mcp_elicitation_reply(
-                &request,
+                &url_request,
+                McpElicitationAction::Accept,
+                Some(json!({"invalid":true}))
+            ),
+            Err(ReplyBuildError::UrlElicitationHasContent)
+        );
+        assert_eq!(
+            mcp_elicitation_reply(
+                &form_request,
                 McpElicitationAction::Decline,
                 Some(json!({"token":"no"}))
             ),
@@ -421,7 +452,7 @@ mod tests {
         );
         assert_eq!(
             mcp_elicitation_reply(
-                &request,
+                &form_request,
                 McpElicitationAction::Accept,
                 Some(json!({"region":"us"}))
             )

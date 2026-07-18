@@ -199,7 +199,7 @@ macro_rules! action {
     };
 }
 
-/// Audited, user-launchable Codex 0.144.2 actions. Every row is a deliberate
+/// Audited, user-launchable Codex 0.145.0-alpha.18 actions. Every row is a deliberate
 /// Discord contract: label, typed input, authorization, confirmation, and
 /// result renderer. Schema-generated handling for unknown future methods is a
 /// compatibility fallback and never enters this registry.
@@ -419,6 +419,16 @@ pub const DEDICATED_ACTIONS: &[DedicatedActionSpec] = &[
         Environments,
         "View environment",
         "Show details for a Codex execution environment.",
+        TypedSchemaForm,
+        Normal,
+        None,
+        Environment
+    ),
+    action!(
+        "environment/status",
+        Environments,
+        "Environment status",
+        "Show the current connection status of a Codex execution environment.",
         TypedSchemaForm,
         Normal,
         None,
@@ -2366,7 +2376,7 @@ fn humanize(value: &str) -> String {
 mod tests {
     use super::*;
 
-    const CODEX_0_144_2_CLIENT_METHODS: &[&str] = &[
+    const CODEX_0_145_0_CLIENT_METHODS: &[&str] = &[
         "account/login/cancel",
         "account/login/start",
         "account/logout",
@@ -2389,6 +2399,7 @@ mod tests {
         "configRequirements/read",
         "environment/add",
         "environment/info",
+        "environment/status",
         "experimentalFeature/enablement/set",
         "experimentalFeature/list",
         "externalAgentConfig/detect",
@@ -2515,16 +2526,16 @@ mod tests {
                 );
             }
         }
-        assert_eq!(methods.len(), 117);
+        assert_eq!(methods.len(), 118);
     }
 
     #[test]
-    fn pinned_0_144_2_schema_has_exact_dedicated_accounting() {
-        assert_eq!(CODEX_0_144_2_CLIENT_METHODS.len(), 122);
+    fn pinned_0_145_0_schema_has_exact_dedicated_accounting() {
+        assert_eq!(CODEX_0_145_0_CLIENT_METHODS.len(), 123);
         let mut methods = std::collections::BTreeSet::new();
         let mut dedicated = 0;
         let mut exempt = 0;
-        for method in CODEX_0_144_2_CLIENT_METHODS {
+        for method in CODEX_0_145_0_CLIENT_METHODS {
             assert!(methods.insert(*method), "duplicate pinned method {method}");
             match (dedicated_action(method), action_exemption(method)) {
                 (Some(_), None) => dedicated += 1,
@@ -2535,7 +2546,7 @@ mod tests {
                 pair => panic!("{method} has invalid registry accounting: {pair:?}"),
             }
         }
-        assert_eq!(dedicated, 117);
+        assert_eq!(dedicated, 118);
         assert_eq!(exempt, 5);
         assert_eq!(dedicated * 100 / (methods.len() - exempt), 100);
     }

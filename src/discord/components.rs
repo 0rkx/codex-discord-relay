@@ -28,6 +28,7 @@ pub const ACTION_CANCEL: &str = "relay:action_cancel";
 pub const APPROVE_ONCE: &str = "relay:approve_once";
 pub const APPROVE_SESSION: &str = "relay:approve_session";
 pub const DENY: &str = "relay:deny";
+pub const CANCEL_REQUEST: &str = "relay:cancel_request";
 pub const ANSWER_REQUEST: &str = "relay:answer_request";
 pub const NEW_TASK_MODAL: &str = "relay:new_task_modal";
 pub const GOD_MODAL: &str = "relay:god_modal";
@@ -290,6 +291,32 @@ pub fn elicitation_confirmation_buttons(request_id: &str) -> Vec<CreateActionRow
             .label("Decline")
             .style(ButtonStyle::Danger),
     ])]
+}
+
+#[must_use]
+pub fn elicitation_url_buttons(request_id: &str, url: Option<&str>) -> Vec<CreateActionRow> {
+    let mut buttons = Vec::new();
+    if let Some(url) = url.filter(|url| {
+        (url.starts_with("https://") || url.starts_with("http://")) && url.len() <= 2_048
+    }) {
+        buttons.push(
+            CreateButton::new_link(url)
+                .label("Open secure page")
+                .emoji('🔗'),
+        );
+    }
+    buttons.extend([
+        CreateButton::new(format!("{APPROVE_ONCE}:{request_id}"))
+            .label("I completed it")
+            .style(ButtonStyle::Success),
+        CreateButton::new(format!("{CANCEL_REQUEST}:{request_id}"))
+            .label("Cancel")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new(format!("{DENY}:{request_id}"))
+            .label("Decline")
+            .style(ButtonStyle::Danger),
+    ]);
+    vec![CreateActionRow::Buttons(buttons)]
 }
 
 pub const OPEN_TASK: &str = "relay:open_task";

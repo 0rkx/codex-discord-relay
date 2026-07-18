@@ -124,6 +124,22 @@ pub fn approval_card(method: &str, params: &Value) -> CreateEmbed {
             .and_then(Value::as_str)
             .unwrap_or("Unknown command");
         format!("```powershell\n{}\n```", truncate(command, 3000))
+    } else if method == "mcpServer/elicitation/request"
+        && params.get("mode").and_then(Value::as_str) == Some("url")
+    {
+        let server = params
+            .get("serverName")
+            .and_then(Value::as_str)
+            .unwrap_or("connector");
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Open the secure page, complete the request, then confirm here.");
+        format!(
+            "**Connector:** {}\n\n{}\n\nUse **Open secure page**, then choose **I completed it**, **Cancel**, or **Decline**.",
+            truncate(server, 200),
+            truncate(message, 3000)
+        )
     } else {
         truncate(
             &serde_json::to_string_pretty(params).unwrap_or_default(),

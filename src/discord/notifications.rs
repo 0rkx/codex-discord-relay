@@ -58,6 +58,8 @@ pub const CURRENT_NOTIFICATION_METHODS: &[&str] = &[
     "thread/closed",
     "thread/compacted",
     "thread/deleted",
+    "thread/environment/connected",
+    "thread/environment/disconnected",
     "thread/goal/cleared",
     "thread/goal/updated",
     "thread/name/updated",
@@ -119,6 +121,8 @@ pub fn classify(method: &str) -> NotificationDisposition {
         | "account/updated"
         | "mcpServer/oauthLogin/completed"
         | "remoteControl/status/changed"
+        | "thread/environment/connected"
+        | "thread/environment/disconnected"
         | "windowsSandbox/setupCompleted" => NotificationDisposition::RunnerStatus,
         "configWarning"
         | "deprecationNotice"
@@ -174,7 +178,7 @@ mod tests {
 
     #[test]
     fn every_installed_notification_has_an_explicit_disposition() {
-        assert_eq!(CURRENT_NOTIFICATION_METHODS.len(), 68);
+        assert_eq!(CURRENT_NOTIFICATION_METHODS.len(), 70);
         for method in CURRENT_NOTIFICATION_METHODS {
             assert_ne!(
                 classify(method),
@@ -202,7 +206,7 @@ mod tests {
             .iter()
             .filter(|method| is_rendered(classify(method)))
             .count();
-        assert_eq!(rendered, 28);
+        assert_eq!(rendered, 30);
         assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 40);
     }
 

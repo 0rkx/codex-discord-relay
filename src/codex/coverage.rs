@@ -270,8 +270,8 @@ mod tests {
             );
         }
         let report = CoverageReport::compute(&catalog);
-        assert_eq!(report.client.total, 122);
-        assert_eq!(report.client.dedicated_ux, 117);
+        assert_eq!(report.client.total, 123);
+        assert_eq!(report.client.dedicated_ux, 118);
         assert_eq!(report.client.exempt, 5);
         assert_eq!(report.client.generic, 0);
         assert!(report.client.generic_methods.is_empty());
