@@ -20,7 +20,7 @@ Public documentation:
 - Previous/Next task browsing preserves search and archive filters across cursor pages
 - Rich embeds, buttons, selects, modals, page-numbered long answers with full Markdown export, attachment support
 - `/actions` provides schema-generated compatibility forms for every non-exempt installed Codex
-  method; the audited codex-cli 0.144.2 snapshot covers 117 user-launchable methods. Schema-untyped
+  method; the audited codex-cli 0.145.0-alpha.18 snapshot covers 118 user-launchable methods. Schema-untyped
   or union-typed parameters (for example `mcpServer/tool/call` arguments and
   `thread/settings/update` policies) accept validated JSON instead of dead-ending as plain text
 - Live response coalescing instead of raw token/log spam; answers track Codex's per-item
@@ -44,8 +44,8 @@ Public documentation:
 - Typed command/file/permission approvals plus question-specific user-input and MCP elicitation
   controls; empty consent forms use direct buttons and large forms use lossless JSON/key-value input
 - New tasks default to GPT-5.6 Sol, medium reasoning, and live web search, with instructions to
-  verify sources and external actions before reporting completion; `/model` and `/effort` expose
-  per-task controls through Discord
+  verify sources and external actions before reporting completion; `/model` and the model-aware
+  `/effort` autocomplete expose per-task controls through Discord
 - Discord attachments are cached locally before dispatch so asynchronous replay never depends on expiring CDN URLs
 - Paged offline message catch-up after Windows runner restarts; ingestion marked with ✅
 - Audited `/advanced` raw RPC remains only as a privileged developer escape hatch
@@ -156,11 +156,11 @@ client; bot responds with a clickable channel mention.
 ## Coverage
 
 The schema is regenerated from the installed Codex at every startup, and Codex Desktop
-auto-updates, so runtime support follows the installed build. Against codex-cli 0.144.2, the
-audited registry accounts for all 122 schema entries (the `initialize` handshake plus 121
-post-initialize methods): 117 user-launchable methods have explicit method-specific Discord specs
+auto-updates, so runtime support follows the installed build. Against codex-cli 0.145.0-alpha.18, the
+audited registry accounts for all 123 schema entries (the `initialize` handshake plus 122
+post-initialize methods): 118 user-launchable methods have explicit method-specific Discord specs
 and five protocol-only methods are not user-launchable.
-That is 117/117 schema-routed user-launchable methods, with zero generic-only or missing registry
+That is 118/118 schema-routed user-launchable methods, with zero generic-only or missing registry
 rows. Coverage includes method discovery, authorization metadata, form generation, and dispatch
 routing. Bespoke Discord presentation is reported separately. The protocol-only methods are the
 JSON-RPC `initialize` handshake, the mock experimental test fixture, two elicitation reference

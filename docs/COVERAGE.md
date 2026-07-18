@@ -22,11 +22,11 @@ routed, but their UI is not necessarily bespoke.
 
 ## Audited snapshot
 
-Against codex-cli 0.144.2, the checked-in registry accounts for 122 client-schema entries:
+Against codex-cli 0.145.0-alpha.18, the checked-in registry accounts for 123 client-schema entries:
 
 | Bucket | Count | Meaning |
 |---|---:|---|
-| User-launchable, schema-routed | 117 | Audited policy, input strategy, validation, and dispatch |
+| User-launchable, schema-routed | 118 | Audited policy, input strategy, validation, and dispatch |
 | Protocol-only methods | 5 | Not user-launchable |
 | Generic-only rows | 0 | Known method without audited routing |
 | Missing rows | 0 | Schema method not represented |
@@ -103,5 +103,5 @@ cargo test --lib -- --ignored --nocapture
 codex-discord.exe doctor --deep
 ```
 
-Public coverage label: **117/117 schema-routed user-launchable methods for the audited Codex
+Public coverage label: **118/118 schema-routed user-launchable methods for the audited Codex
 version**. Live end-to-end flow results are reported separately from protocol routing.

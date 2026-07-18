@@ -63,6 +63,10 @@ Relay currently registers 30 guild slash commands.
 | Protocol access | `/actions`, `/advanced` | Browse schema-routed actions or invoke a raw method |
 | Privileged mode | `/god`, `/god_off` | Start or revoke task-scoped unrestricted execution |
 
+New tasks start with `gpt-5.6-sol` and `medium` reasoning. `/model` changes model for later turns.
+`/effort` fetches the selected model's live reasoning-effort catalog for autocomplete and rejects
+values that model does not support; GPT-5.6 Sol currently exposes `low` through `ultra`.
+
 `/advanced` is task-bound, requires active GOD mode, validates JSON against the installed schema,
 and exists for developer recovery—not routine use.
 
