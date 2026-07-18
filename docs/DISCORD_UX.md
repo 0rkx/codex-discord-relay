@@ -94,6 +94,11 @@ and exists for developer recovery—not routine use.
 - Autocomplete is backed by the installed app-server schema for methods and other live catalogs.
 - Final answer, status, plan, activity, audit, approval, and warning cards use embeds with distinct
   state colors and compact fields.
+- One editable live-operations card coalesces command output, MCP progress, and file-change state.
+  A separate realtime card coalesces transcripts and session lifecycle; PCM16 audio is delivered
+  as a bounded WAV attachment when the session closes.
+- Generated images and workspace-confined viewed images are validated by magic bytes and delivered
+  as Discord attachments through the durable media outbox.
 
 Action forms may span several modal pages because Discord limits modal fields. JSON-shaped or
 union-typed parameters use a validated JSON field when Discord controls cannot represent the
@@ -114,9 +119,10 @@ after recovery instead of assuming unlimited backlog replay.
 - Schema routing coverage does not mean every method has unique handcrafted Discord presentation.
 - Long final answers show the first page in the embed and attach complete Markdown; they do not yet
   provide interactive page navigation through every page.
-- High-volume command/realtime item output is not a terminal emulator. Use `/terminals` for
-  background-terminal lifecycle and the workspace for full generated artifacts.
-- Generated images and other non-text Codex items do not all have equally rich Discord rendering.
+- Live cards show bounded redacted tails, not an unrestricted terminal emulator. Use `/terminals`
+  for background-terminal lifecycle and the workspace for complete raw artifacts.
+- Connection-scoped standalone process output is bounded internally; it cannot be shown in a task
+  channel until Codex provides a safe initiating-task correlation.
 - Provider sign-in, connector authorization, Discord application creation, and server creation
   remain provider-owned UI steps.
 

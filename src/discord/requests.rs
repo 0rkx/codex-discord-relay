@@ -115,27 +115,94 @@ impl ServerReply {
     }
 }
 
-/// Decisions the Discord approval card can actually produce. The protocol
-/// also accepts `cancel`, but no relay control emits it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Modern app-server approval decision. Amendment payloads must be copied from
+/// the request's server-offered `availableDecisions`; Discord text must never
+/// be used to synthesize a policy rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
-    #[serde(rename = "accept")]
     Accept,
-    #[serde(rename = "acceptForSession")]
     AcceptForSession,
-    #[serde(rename = "decline")]
     Decline,
+    Cancel,
+    AcceptWithExecpolicyAmendment(Vec<String>),
+    ApplyNetworkPolicyAmendment(NetworkPolicyAmendment),
 }
 
-/// Legacy decision vocabulary, likewise limited to what the card can send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LegacyApprovalDecision {
-    #[serde(rename = "approved")]
     Approved,
-    #[serde(rename = "approved_for_session")]
     ApprovedForSession,
-    #[serde(rename = "denied")]
     Denied,
+    TimedOut,
+    Abort,
+    ApprovedExecpolicyAmendment(Vec<String>),
+    NetworkPolicyAmendment(NetworkPolicyAmendment),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NetworkPolicyAmendment {
+    pub host: String,
+    pub action: NetworkPolicyAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkPolicyAction {
+    Allow,
+    Deny,
+}
+
+impl Serialize for ApprovalDecision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Accept => serializer.serialize_str("accept"),
+            Self::AcceptForSession => serializer.serialize_str("acceptForSession"),
+            Self::Decline => serializer.serialize_str("decline"),
+            Self::Cancel => serializer.serialize_str("cancel"),
+            Self::AcceptWithExecpolicyAmendment(amendment) => json!({
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": amendment
+                }
+            })
+            .serialize(serializer),
+            Self::ApplyNetworkPolicyAmendment(amendment) => json!({
+                "applyNetworkPolicyAmendment": {
+                    "network_policy_amendment": amendment
+                }
+            })
+            .serialize(serializer),
+        }
+    }
+}
+
+impl Serialize for LegacyApprovalDecision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Approved => serializer.serialize_str("approved"),
+            Self::ApprovedForSession => serializer.serialize_str("approved_for_session"),
+            Self::Denied => serializer.serialize_str("denied"),
+            Self::TimedOut => serializer.serialize_str("timed_out"),
+            Self::Abort => serializer.serialize_str("abort"),
+            Self::ApprovedExecpolicyAmendment(amendment) => json!({
+                "approved_execpolicy_amendment": {
+                    "proposed_execpolicy_amendment": amendment
+                }
+            })
+            .serialize(serializer),
+            Self::NetworkPolicyAmendment(amendment) => json!({
+                "network_policy_amendment": {
+                    "network_policy_amendment": amendment
+                }
+            })
+            .serialize(serializer),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -170,6 +237,90 @@ pub enum ReplyBuildError {
     RejectedElicitationHasContent,
     #[error("URL MCP elicitation responses must not include content")]
     UrlElicitationHasContent,
+    #[error("approval decision index was not offered by the app-server")]
+    DecisionNotOffered,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfferedApprovalDecision {
+    pub index: usize,
+    pub label: &'static str,
+    value: Value,
+}
+
+/// Parse only the installed modern decision union. Unknown future objects are
+/// omitted instead of being echoed blindly. Original indexes are retained so
+/// Discord can select the exact server-owned value without synthesizing it.
+#[must_use]
+pub fn offered_approval_decisions(request: &ServerRequest) -> Option<Vec<OfferedApprovalDecision>> {
+    let values = request.params.get("availableDecisions")?.as_array()?;
+    Some(
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                offered_decision_label(value).map(|label| OfferedApprovalDecision {
+                    index,
+                    label,
+                    value: value.clone(),
+                })
+            })
+            .collect(),
+    )
+}
+
+pub fn approval_reply_from_offered(
+    request: &ServerRequest,
+    index: usize,
+) -> Result<ServerReply, ReplyBuildError> {
+    match ServerRequestMethod::classify(&request.method) {
+        ServerRequestMethod::CommandExecutionApproval | ServerRequestMethod::FileChangeApproval => {
+        }
+        _ => return Err(wrong_method(request)),
+    }
+    let decision = offered_approval_decisions(request)
+        .and_then(|decisions| {
+            decisions
+                .into_iter()
+                .find(|decision| decision.index == index)
+        })
+        .ok_or(ReplyBuildError::DecisionNotOffered)?;
+    Ok(ServerReply::result(
+        request,
+        json!({"decision": decision.value}),
+    ))
+}
+
+fn offered_decision_label(value: &Value) -> Option<&'static str> {
+    match value {
+        Value::String(value) => match value.as_str() {
+            "accept" => Some("Approve once"),
+            "acceptForSession" => Some("Approve session"),
+            "decline" => Some("Decline"),
+            "cancel" => Some("Cancel and stop"),
+            _ => None,
+        },
+        Value::Object(object) if object.len() == 1 => {
+            if let Some(amendment) = object.get("acceptWithExecpolicyAmendment") {
+                let rules = amendment
+                    .get("execpolicy_amendment")
+                    .and_then(Value::as_array)?;
+                rules
+                    .iter()
+                    .all(|rule| rule.as_str().is_some_and(|rule| rule.len() <= 4_096))
+                    .then_some("Approve + command rule")
+            } else if let Some(amendment) = object.get("applyNetworkPolicyAmendment") {
+                let policy = amendment.get("network_policy_amendment")?;
+                let host = policy.get("host").and_then(Value::as_str)?;
+                let action = policy.get("action").and_then(Value::as_str)?;
+                (!host.is_empty() && host.len() <= 255 && matches!(action, "allow" | "deny"))
+                    .then_some("Apply network rule")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn approval_reply(
@@ -315,6 +466,7 @@ mod tests {
             id,
             method: method.to_owned(),
             params: json!({"secret":"must-not-leak"}),
+            generation: 1,
         }
     }
 
@@ -384,6 +536,150 @@ mod tests {
                 result: json!({"decision":"approved_for_session"})
             }
         );
+    }
+
+    #[test]
+    fn every_modern_approval_variant_has_the_exact_installed_shape() {
+        let request = request(json!(1), "item/commandExecution/requestApproval");
+        for (decision, expected) in [
+            (ApprovalDecision::Accept, json!("accept")),
+            (
+                ApprovalDecision::AcceptForSession,
+                json!("acceptForSession"),
+            ),
+            (ApprovalDecision::Decline, json!("decline")),
+            (ApprovalDecision::Cancel, json!("cancel")),
+            (
+                ApprovalDecision::AcceptWithExecpolicyAmendment(vec!["allow command".to_owned()]),
+                json!({
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": ["allow command"]
+                    }
+                }),
+            ),
+            (
+                ApprovalDecision::ApplyNetworkPolicyAmendment(NetworkPolicyAmendment {
+                    host: "example.test".to_owned(),
+                    action: NetworkPolicyAction::Allow,
+                }),
+                json!({
+                    "applyNetworkPolicyAmendment": {
+                        "network_policy_amendment": {
+                            "host": "example.test",
+                            "action": "allow"
+                        }
+                    }
+                }),
+            ),
+        ] {
+            let ServerReply::Result { result, .. } = approval_reply(&request, decision).unwrap()
+            else {
+                panic!("modern approval must return a result")
+            };
+            assert_eq!(result["decision"], expected);
+        }
+    }
+
+    #[test]
+    fn offered_decisions_are_indexed_and_echoed_exactly() {
+        let mut request = request(json!(7), "item/commandExecution/requestApproval");
+        request.params = json!({
+            "availableDecisions": [
+                "accept",
+                "decline",
+                {"acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": ["allow git status"]
+                }},
+                {"applyNetworkPolicyAmendment": {
+                    "network_policy_amendment": {
+                        "host": "example.test",
+                        "action": "allow"
+                    }
+                }}
+            ]
+        });
+        let choices = offered_approval_decisions(&request).unwrap();
+        assert_eq!(choices.len(), 4);
+        assert_eq!(choices[2].index, 2);
+        assert_eq!(choices[2].label, "Approve + command rule");
+        assert_eq!(
+            approval_reply_from_offered(&request, 2).unwrap(),
+            ServerReply::Result {
+                id: json!(7),
+                result: json!({"decision": {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": ["allow git status"]
+                    }
+                }})
+            }
+        );
+        assert_eq!(
+            approval_reply_from_offered(&request, 99),
+            Err(ReplyBuildError::DecisionNotOffered)
+        );
+    }
+
+    #[test]
+    fn unknown_or_malformed_offered_decisions_fail_closed() {
+        let mut request = request(json!(8), "item/commandExecution/requestApproval");
+        request.params = json!({"availableDecisions": [
+            "futureDecision",
+            {"applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {"host":"example.test","action":"execute"}
+            }},
+            {"futureObject": {"secret":"do not echo"}}
+        ]});
+        assert!(offered_approval_decisions(&request).unwrap().is_empty());
+        assert_eq!(
+            approval_reply_from_offered(&request, 0),
+            Err(ReplyBuildError::DecisionNotOffered)
+        );
+    }
+
+    #[test]
+    fn every_legacy_approval_variant_has_the_exact_installed_shape() {
+        let request = request(json!(1), "execCommandApproval");
+        for (decision, expected) in [
+            (LegacyApprovalDecision::Approved, json!("approved")),
+            (
+                LegacyApprovalDecision::ApprovedForSession,
+                json!("approved_for_session"),
+            ),
+            (LegacyApprovalDecision::Denied, json!("denied")),
+            (LegacyApprovalDecision::TimedOut, json!("timed_out")),
+            (LegacyApprovalDecision::Abort, json!("abort")),
+            (
+                LegacyApprovalDecision::ApprovedExecpolicyAmendment(vec![
+                    "allow command".to_owned(),
+                ]),
+                json!({
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": ["allow command"]
+                    }
+                }),
+            ),
+            (
+                LegacyApprovalDecision::NetworkPolicyAmendment(NetworkPolicyAmendment {
+                    host: "example.test".to_owned(),
+                    action: NetworkPolicyAction::Deny,
+                }),
+                json!({
+                    "network_policy_amendment": {
+                        "network_policy_amendment": {
+                            "host": "example.test",
+                            "action": "deny"
+                        }
+                    }
+                }),
+            ),
+        ] {
+            let ServerReply::Result { result, .. } =
+                legacy_approval_reply(&request, decision).unwrap()
+            else {
+                panic!("legacy approval must return a result")
+            };
+            assert_eq!(result["decision"], expected);
+        }
     }
 
     #[test]

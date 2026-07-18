@@ -290,6 +290,60 @@ pub fn activity_card(lines: &[String]) -> CreateEmbed {
         .timestamp(Timestamp::now())
 }
 
+/// One coalesced card for command, MCP, and patch progress. Callers provide
+/// already-redacted bounded summaries; this final clamp preserves Discord's
+/// per-embed description ceiling even if several operations update together.
+pub fn live_operations_card(summaries: &[String]) -> CreateEmbed {
+    let description = if summaries.is_empty() {
+        "_Waiting for operation output…_".to_owned()
+    } else {
+        truncate(&summaries.join("\n\n"), 4_000)
+    };
+    CreateEmbed::new()
+        .title("⚙️ Live operations")
+        .description(description)
+        .color(0x0058_65F2)
+        .timestamp(Timestamp::now())
+}
+
+/// Coalesced live transcript for one experimental Codex realtime session.
+pub fn realtime_card(
+    transcript: &str,
+    active: bool,
+    failed: bool,
+    version: Option<&str>,
+    close_reason: Option<&str>,
+) -> CreateEmbed {
+    let mut embed = CreateEmbed::new()
+        .title(if active {
+            "🎙️ Realtime transcript · live"
+        } else if failed {
+            "🎙️ Realtime transcript · error"
+        } else {
+            "🎙️ Realtime transcript · closed"
+        })
+        .description(if transcript.is_empty() {
+            "_Waiting for transcript…_".to_owned()
+        } else {
+            truncate(transcript, 4_000)
+        })
+        .color(if active {
+            0x0058_65F2
+        } else if failed {
+            0x00ED_4245
+        } else {
+            0x0057_F287
+        })
+        .timestamp(Timestamp::now());
+    if let Some(version) = version {
+        embed = embed.field("Protocol", format!("`{}`", truncate(version, 30)), true);
+    }
+    if let Some(reason) = close_reason {
+        embed = embed.field("Closed", truncate(reason, 300), false);
+    }
+    embed
+}
+
 /// Render the current turn plan from `turn/plan/updated` params.
 pub fn plan_card(params: &Value) -> CreateEmbed {
     let mut description = String::new();

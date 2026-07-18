@@ -11,6 +11,16 @@ stable public API is declared.
   tools, bounded concurrent routing, rich activity rendering, and live-tested cold resume/fork
   inheritance.
 - First-class `/plugins` catalog, detail, policy-aware install/uninstall, and authentication UX.
+- Bounded live-operation and realtime projections, validated PCM16 WAV delivery, generated/viewed
+  image attachments, and a durable retrying media outbox.
+- Process-generation-bound approvals, server-offered policy amendment controls, cancel/timeout
+  parity, resolved-request race tombstones, and 15-minute live request expiry.
+
+### Fixed
+
+- Realtime audio now latches at the first rejected chunk instead of splicing later audio, preserves
+  error state through close, heals interleaved transcript completion, and marks lagged sessions.
+- Digest delivery retries after Discord failures instead of consuming the terminal dirty state.
 
 ## [0.1.1] - 2026-07-18
 
@@ -71,4 +81,4 @@ Initial public preview.
 - Bounded in-memory Codex server-request delivery can lag; Relay logs/audits the condition, but the
   affected task may require interruption.
 - Long answers include complete Markdown but do not provide interactive page-by-page navigation.
-- Some high-volume command/realtime and generated-image item types have limited Discord rendering.
+- Connection-scoped standalone output cannot be rendered until Codex supplies safe task correlation.

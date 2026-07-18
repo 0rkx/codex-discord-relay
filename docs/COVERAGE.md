@@ -65,6 +65,10 @@ Server-request classification coverage does not make its delivery queue durable.
 receiver can drop a pending approval and leave a turn waiting. Relay logs and audits this condition;
 interrupt the affected task.
 
+Once received, an interactive request is bound to its app-server process generation, externally
+resolved requests are tombstoned across setup races, offered policy choices are echoed exactly,
+and unanswered cards expire after 15 minutes with the protocol-specific terminal response.
+
 ## Notifications
 
 Each installed notification must have an explicit semantic disposition before the live report is
@@ -75,8 +79,10 @@ fully accounted:
   transport noise.
 
 Only authoritative agent-message data enters the final answer accumulator. This prevents command
-logs or unrelated deltas from corrupting assistant text. Explicit disposition still does not imply
-a unique visual for every Codex item type.
+logs or unrelated deltas from corrupting assistant text. In the audited 70-notification snapshot,
+39 methods feed rendered state and 31 are explicitly audit-only, transport-only, standalone, or
+superseded by authoritative completion. Command/MCP/patch progress, realtime transcript/audio,
+and completed image items have dedicated bounded paths.
 
 ## End-to-end evidence
 

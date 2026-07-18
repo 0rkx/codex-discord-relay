@@ -31,7 +31,7 @@ autocomplete, attachments, permissions, and guild command registration. It provi
 
 - one private Discord channel per materialized Codex task;
 - control channels for creation, browsing, runner state, and audit events;
-- coalesced answer, activity, and plan cards instead of one message per token;
+- coalesced answer, activity, plan, live-operation, and realtime cards instead of one message per delta;
 - typed approval and user-input cards for server-initiated requests;
 - schema-generated action forms and a GOD-gated raw RPC escape hatch.
 
@@ -63,7 +63,7 @@ number—is runtime authority.
 - task-to-channel mirrors and channel ingestion cursors;
 - pending approvals and elicitation requests;
 - redacted audit events;
-- a deduplicated Discord delivery outbox;
+- a deduplicated Discord delivery outbox for final answers and validated media attachments;
 - tasks requiring post-GOD cleanup;
 - durable retries for deletion of messages beginning with `!god`.
 
@@ -91,7 +91,7 @@ ACL management.
 1. Owner posts text or an attachment in a task channel, or uses a slash command/component.
 2. Relay verifies guild, owner, channel privacy, task binding, and action policy.
 3. Relay converts the interaction to typed app-server parameters and sends one JSON-RPC request.
-4. Codex notifications update coalesced plan, activity, and answer state.
+4. Codex notifications update coalesced plan, activity, answer, live-operation, realtime, and media state.
 5. Approval or elicitation requests become owner-bound Discord components or modals.
 6. Final answer is written through the durable outbox and the task channel moves to its new state.
 7. If the relay was offline, it scans from the stored channel cursor and replays unprocessed owner
@@ -101,12 +101,12 @@ ACL management.
 
 - Tokio tasks separate Discord Gateway handling, Codex reads, stream flushing, outbox delivery,
   sensitive-message deletion, and GOD expiry.
-- Codex request IDs are correlated through one process generation; a connection loss fails
-  pending work and permits a fresh child to initialize.
+- Codex request IDs and server-request replies are bound to one process generation; a connection
+  loss fails pending work and a stale Discord card cannot answer a new child.
 - Task ingestion locks prevent the same channel from being replayed concurrently.
 - GOD lifecycle guards prevent activation, expiry, revocation, and privileged dispatch from
   crossing each other. A task stays quarantined until permissions are normalized after GOD use.
-- A lagged Codex notification receiver is logged. A lagged server-request receiver is also audited
+- A lagged Codex notification receiver marks active projections incomplete. A lagged server-request receiver is also audited
   because a dropped approval could leave a turn waiting; interrupt the affected task if this alert
   appears. This is a known operational limit, not a durability guarantee for that in-memory queue.
 

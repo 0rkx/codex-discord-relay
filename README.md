@@ -47,7 +47,12 @@ Public documentation:
 - `/email` opens a native modal, attaches Gmail explicitly, and carries installation,
   authorization, approval, and send results through the Codex connector flow
 - Typed command/file/permission approvals plus question-specific user-input and MCP elicitation
-  controls; empty consent forms use direct buttons and large forms use lossless JSON/key-value input
+  controls; cards honor Codex `availableDecisions`, copy policy amendments only from the server,
+  bind replies to the originating app-server process, and expire after 15 minutes
+- Coalesced live-operation and realtime transcript cards expose command output, MCP progress,
+  patch state, lifecycle errors, and bounded PCM16 audio without one Discord message per delta
+- Completed generated/viewed workspace images and realtime WAV audio use a durable local media
+  outbox, safe file validation, Discord attachments, and retry/dead-letter delivery
 - New tasks default to GPT-5.6 Sol, medium reasoning, and live web search, with instructions to
   verify sources and external actions before reporting completion; `/model` and the model-aware
   `/effort` autocomplete expose per-task controls through Discord
@@ -179,8 +184,9 @@ receive an audited spec or protocol-only classification. Methods absent from an 
 build fail fast with a clear capability message. Run `/capabilities` for the live routing numbers;
 use the live user-flow matrix for end-to-end UX evidence.
 
-Every installed notification has an explicit semantic disposition; only agent-message delta
-enters the answer stream. Every installed server request has an explicit host disposition:
+Every installed notification has an explicit semantic disposition; command/MCP/patch/realtime
+streams use separate bounded projections and only agent-message delta enters the answer stream.
+Every installed server request has an explicit host disposition:
 interactive approvals/input, host-handled time reads, and deliberately unadvertised host
 capabilities that fail closed if a peer violates negotiation. Methods the router knows but the
 installed build no longer sends stay dormant. Account/auth browser handoffs and provider

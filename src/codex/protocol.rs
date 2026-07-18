@@ -17,6 +17,8 @@ pub struct RpcErrorObject {
 pub struct Notification {
     pub method: String,
     pub params: Value,
+    /// Local app-server process generation that emitted this notification.
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +26,9 @@ pub struct ServerRequest {
     pub id: Value,
     pub method: String,
     pub params: Value,
+    /// Local app-server process generation that emitted this request. This is
+    /// host metadata and is never serialized onto the JSON-RPC wire.
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,10 +66,12 @@ pub(crate) fn classify_message(value: &Value) -> Result<WireMessage, &'static st
                 id,
                 method: method.to_owned(),
                 params,
+                generation: 0,
             }),
             None => WireMessage::Notification(Notification {
                 method: method.to_owned(),
                 params,
+                generation: 0,
             }),
         });
     }

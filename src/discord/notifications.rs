@@ -5,6 +5,12 @@ pub enum NotificationDisposition {
     TaskLifecycle,
     PlanUpdated,
     ItemActivity,
+    RealtimeTranscript,
+    RealtimeAudio,
+    RealtimeLifecycle,
+    OperationProgress,
+    StandaloneOutput,
+    StandaloneLifecycle,
     TokenUsage,
     RequestResolved,
     RunnerStatus,
@@ -93,21 +99,28 @@ pub fn classify(method: &str) -> NotificationDisposition {
         "turn/plan/updated" => NotificationDisposition::PlanUpdated,
         "item/started" | "item/completed" => NotificationDisposition::ItemActivity,
         "thread/tokenUsage/updated" => NotificationDisposition::TokenUsage,
-        "serverRequest/resolved" => NotificationDisposition::RequestResolved,
-        "command/exec/outputDelta"
-        | "externalAgentConfig/import/progress"
-        | "fuzzyFileSearch/sessionUpdated"
-        | "item/commandExecution/outputDelta"
+        "thread/realtime/transcript/delta" | "thread/realtime/transcript/done" => {
+            NotificationDisposition::RealtimeTranscript
+        }
+        "thread/realtime/outputAudio/delta" => NotificationDisposition::RealtimeAudio,
+        "thread/realtime/started" | "thread/realtime/closed" | "thread/realtime/error" => {
+            NotificationDisposition::RealtimeLifecycle
+        }
+        "item/commandExecution/outputDelta"
         | "item/fileChange/outputDelta"
         | "item/fileChange/patchUpdated"
-        | "item/mcpToolCall/progress"
+        | "item/mcpToolCall/progress" => NotificationDisposition::OperationProgress,
+        "command/exec/outputDelta" | "process/outputDelta" => {
+            NotificationDisposition::StandaloneOutput
+        }
+        "process/exited" => NotificationDisposition::StandaloneLifecycle,
+        "serverRequest/resolved" => NotificationDisposition::RequestResolved,
+        "externalAgentConfig/import/progress"
+        | "fuzzyFileSearch/sessionUpdated"
         | "item/plan/delta"
         | "item/reasoning/summaryPartAdded"
         | "item/reasoning/summaryTextDelta"
-        | "item/reasoning/textDelta"
-        | "process/outputDelta"
-        | "thread/realtime/outputAudio/delta"
-        | "thread/realtime/transcript/delta" => NotificationDisposition::HighVolumeStream,
+        | "item/reasoning/textDelta" => NotificationDisposition::HighVolumeStream,
         "thread/archived"
         | "thread/closed"
         | "thread/compacted"
@@ -129,7 +142,6 @@ pub fn classify(method: &str) -> NotificationDisposition {
         | "error"
         | "guardianWarning"
         | "model/rerouted"
-        | "thread/realtime/error"
         | "warning"
         | "windows/worldWritableWarning" => NotificationDisposition::UserAlert,
         "app/list/updated"
@@ -144,15 +156,11 @@ pub fn classify(method: &str) -> NotificationDisposition {
         | "mcpServer/startupStatus/updated"
         | "model/safetyBuffering/updated"
         | "model/verification"
-        | "process/exited"
         | "skills/changed"
         | "thread/goal/cleared"
         | "thread/goal/updated"
-        | "thread/realtime/closed"
         | "thread/realtime/itemAdded"
         | "thread/realtime/sdp"
-        | "thread/realtime/started"
-        | "thread/realtime/transcript/done"
         | "thread/settings/updated"
         | "thread/started"
         | "thread/status/changed"
@@ -167,6 +175,8 @@ pub const fn is_rendered(disposition: NotificationDisposition) -> bool {
     !matches!(
         disposition,
         NotificationDisposition::HighVolumeStream
+            | NotificationDisposition::StandaloneOutput
+            | NotificationDisposition::StandaloneLifecycle
             | NotificationDisposition::AuditOnly
             | NotificationDisposition::Unknown
     )
@@ -196,7 +206,7 @@ mod tests {
         );
         assert_eq!(
             classify("process/outputDelta"),
-            NotificationDisposition::HighVolumeStream
+            NotificationDisposition::StandaloneOutput
         );
     }
 
@@ -206,8 +216,8 @@ mod tests {
             .iter()
             .filter(|method| is_rendered(classify(method)))
             .count();
-        assert_eq!(rendered, 30);
-        assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 40);
+        assert_eq!(rendered, 39);
+        assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 31);
     }
 
     #[test]

@@ -116,9 +116,10 @@ Windows account controls if local data confidentiality matters.
 - A poison Discord delivery dead-letters after ten attempts and becomes visible in runner status.
 
 One current limit requires operator attention: Codex notifications and server requests enter
-bounded in-memory broadcast receivers. Notification lag is logged. Server-request lag is logged and
-audited because a dropped approval may leave a Codex turn waiting without a Discord card. Interrupt
-that task and investigate resource pressure; do not assume those requests are durable.
+bounded in-memory broadcast receivers. Notification lag is logged and active output projections are
+marked incomplete. Server-request lag is logged and audited because a request dropped before Relay
+receives it cannot receive a Discord card or expiry response. Interrupt that task and investigate
+resource pressure; do not assume the broadcast receiver itself is durable.
 
 ## Deployment guidance
 

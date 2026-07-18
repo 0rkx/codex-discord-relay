@@ -567,6 +567,39 @@ impl CodexClient {
         self.write_json(&json!({"id": id, "error": error})).await
     }
 
+    /// Reply only to the exact app-server process that emitted the request.
+    /// JSON-RPC ids may be reused after reconnect, so an id alone is not a
+    /// safe correlation key across process generations.
+    pub async fn respond_result_for_generation(
+        &self,
+        generation: u64,
+        id: Value,
+        result: Value,
+    ) -> Result<(), ClientError> {
+        if request_id_key(&id).is_none() {
+            return Err(ClientError::Protocol(
+                "cannot respond with an invalid JSON-RPC request id".into(),
+            ));
+        }
+        self.write_json_for_generation(generation, &json!({"id": id, "result": result}))
+            .await
+    }
+
+    pub async fn respond_error_for_generation(
+        &self,
+        generation: u64,
+        id: Value,
+        error: RpcErrorObject,
+    ) -> Result<(), ClientError> {
+        if request_id_key(&id).is_none() {
+            return Err(ClientError::Protocol(
+                "cannot respond with an invalid JSON-RPC request id".into(),
+            ));
+        }
+        self.write_json_for_generation(generation, &json!({"id": id, "error": error}))
+            .await
+    }
+
     pub async fn thread_list(&self, params: ThreadListParams) -> Result<Value, ClientError> {
         self.request("thread/list", params).await
     }
@@ -900,7 +933,7 @@ impl CodexClient {
                 {
                     Ok(true) => match std::str::from_utf8(&line) {
                         Ok(line) if line.trim().is_empty() => {}
-                        Ok(line) => handle_stdout_line(&inner, line).await,
+                        Ok(line) => handle_stdout_line(&inner, generation, line).await,
                         Err(error) => {
                             lose_connection(
                                 &inner,
@@ -996,6 +1029,56 @@ impl CodexClient {
             // request. Invalidate this generation and release every waiter so
             // the next operation can establish a fresh app-server process.
             lose_connection(&self.inner, generation, error.to_string()).await;
+        }
+        result
+    }
+
+    async fn write_json_for_generation(
+        &self,
+        expected_generation: u64,
+        value: &Value,
+    ) -> Result<(), ClientError> {
+        if !self.inner.connected.load(Ordering::Acquire)
+            || self.inner.generation.load(Ordering::Acquire) != expected_generation
+        {
+            return Err(ClientError::ConnectionLost(
+                "server request belongs to a stale app-server generation".into(),
+            ));
+        }
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        let write_timeout = self.inner.request_timeout.min(DEFAULT_WRITE_TIMEOUT);
+        let result = match timeout(write_timeout, async {
+            let mut writer = self.inner.stdin.lock().await;
+            if !self.inner.connected.load(Ordering::Acquire)
+                || self.inner.generation.load(Ordering::Acquire) != expected_generation
+            {
+                return Err(ClientError::ConnectionLost(
+                    "server request belongs to a stale app-server generation".into(),
+                ));
+            }
+            let writer = writer
+                .as_mut()
+                .ok_or_else(|| ClientError::ConnectionLost("stdin is unavailable".into()))?;
+            writer.write_all(&bytes).await.map_err(ClientError::Write)?;
+            writer.flush().await.map_err(ClientError::Write)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ClientError::WriteTimeout {
+                millis: write_timeout.as_millis(),
+            }),
+        };
+        if let Err(
+            error @ (ClientError::Write(_)
+            | ClientError::WriteTimeout { .. }
+            | ClientError::ConnectionLost(_)),
+        ) = &result
+            && self.inner.generation.load(Ordering::Acquire) == expected_generation
+        {
+            // A stale approval must never invalidate a newer app-server.
+            lose_connection(&self.inner, expected_generation, error.to_string()).await;
         }
         result
     }
@@ -1104,9 +1187,9 @@ where
     }
 }
 
-async fn handle_stdout_line(inner: &Arc<Inner>, line: &str) {
+async fn handle_stdout_line(inner: &Arc<Inner>, generation: u64, line: &str) {
     match serde_json::from_str::<Value>(line) {
-        Ok(value) => handle_incoming(inner, value).await,
+        Ok(value) => handle_incoming(inner, generation, value).await,
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -1117,7 +1200,7 @@ async fn handle_stdout_line(inner: &Arc<Inner>, line: &str) {
     }
 }
 
-async fn handle_incoming(inner: &Arc<Inner>, value: Value) {
+async fn handle_incoming(inner: &Arc<Inner>, generation: u64, value: Value) {
     match classify_message(&value) {
         Ok(WireMessage::Response { id, result }) => {
             let Some(id) = request_id_key(&id) else {
@@ -1134,10 +1217,12 @@ async fn handle_incoming(inner: &Arc<Inner>, value: Value) {
                 let _ = sender.send(result);
             }
         }
-        Ok(WireMessage::Notification(notification)) => {
+        Ok(WireMessage::Notification(mut notification)) => {
+            notification.generation = generation;
             let _ = inner.notifications.send(notification);
         }
-        Ok(WireMessage::ServerRequest(request)) => {
+        Ok(WireMessage::ServerRequest(mut request)) => {
+            request.generation = generation;
             let _ = inner.server_requests.send(request);
         }
         Err(error) => tracing::warn!(%error, "ignoring malformed app-server message"),
@@ -1213,24 +1298,30 @@ mod tests {
         let inner = test_inner();
         let (sender, receiver) = oneshot::channel();
         inner.pending.lock().await.insert("7".into(), sender);
-        handle_incoming(&inner, json!({"id": 7, "result": {"ok": true}})).await;
+        handle_incoming(&inner, 1, json!({"id": 7, "result": {"ok": true}})).await;
         assert_eq!(receiver.await.unwrap().unwrap(), json!({"ok": true}));
 
         let mut notifications = inner.notifications.subscribe();
         handle_incoming(
             &inner,
+            1,
             json!({"method": "turn/completed", "params": {"threadId": "t"}}),
         )
         .await;
-        assert_eq!(notifications.recv().await.unwrap().method, "turn/completed");
+        let notification = notifications.recv().await.unwrap();
+        assert_eq!(notification.method, "turn/completed");
+        assert_eq!(notification.generation, 1);
 
         let mut requests = inner.server_requests.subscribe();
         handle_incoming(
             &inner,
+            1,
             json!({"id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {}}),
         )
         .await;
-        assert_eq!(requests.recv().await.unwrap().id, "approval-1");
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.id, "approval-1");
+        assert_eq!(request.generation, 1);
     }
 
     #[test]
@@ -1250,8 +1341,26 @@ mod tests {
             .lock()
             .await
             .insert("\"future-1\"".into(), sender);
-        handle_incoming(&inner, json!({"id": "future-1", "result": true})).await;
+        handle_incoming(&inner, 1, json!({"id": "future-1", "result": true})).await;
         assert_eq!(receiver.await.unwrap().unwrap(), json!(true));
+    }
+
+    #[tokio::test]
+    async fn stale_server_request_cannot_reply_into_a_new_generation() {
+        let inner = test_inner();
+        inner.generation.store(2, Ordering::Release);
+        let client = CodexClient {
+            inner: Arc::clone(&inner),
+        };
+        let error = client
+            .respond_result_for_generation(1, json!(7), json!({"decision":"accept"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientError::ConnectionLost(message) if message.contains("stale app-server generation"))
+        );
+        assert_eq!(inner.generation.load(Ordering::Acquire), 2);
+        assert!(inner.connected.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1260,11 +1369,11 @@ mod tests {
         let (sender, receiver) = oneshot::channel();
         inner.pending.lock().await.insert("9".into(), sender);
 
-        handle_stdout_line(&inner, "app-server diagnostic that is not JSON").await;
+        handle_stdout_line(&inner, 1, "app-server diagnostic that is not JSON").await;
         assert!(inner.connected.load(Ordering::Acquire));
         assert_eq!(inner.pending.lock().await.len(), 1);
 
-        handle_stdout_line(&inner, r#"{"id":9,"result":{"alive":true}}"#).await;
+        handle_stdout_line(&inner, 1, r#"{"id":9,"result":{"alive":true}}"#).await;
         assert_eq!(receiver.await.unwrap().unwrap(), json!({"alive": true}));
         assert!(inner.connected.load(Ordering::Acquire));
     }

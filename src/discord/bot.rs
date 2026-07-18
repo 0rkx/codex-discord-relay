@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -21,14 +22,17 @@ use serenity::{
         Message, ModalInteraction, Ready, UserId,
     },
     builder::{
-        CreateActionRow, CreateAttachment, CreateAutocompleteResponse,
+        CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateAutocompleteResponse,
         CreateCommand as CommandBuilder, CreateEmbed, CreateInteractionResponse,
         CreateInteractionResponseMessage, CreateMessage, CreateModal, EditInteractionResponse,
         EditMessage,
     },
     http::{Http, HttpError},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    io::AsyncReadExt as _,
+    sync::{Mutex, RwLock},
+};
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
@@ -50,6 +54,7 @@ use crate::{
         components, embeds,
         host_broker::HostBroker,
         notifications,
+        projection::{CompletionState, OutputChunk, OutputStream, PatchState, ProjectionCore},
         provision::{self, Layout},
         requests::{
             self, ApprovalDecision, LegacyApprovalDecision, McpElicitationAction, PermissionGrant,
@@ -175,6 +180,278 @@ struct PlanBoard {
     message_id: Option<u64>,
     params: Value,
     dirty: bool,
+}
+
+const MAX_REALTIME_TRANSCRIPT_CHARS: usize = 12_000;
+// Discord's default per-file ceiling is 10 MiB. Keep room for multipart
+// framing and the 44-byte WAV header instead of assuming a boosted guild.
+const MAX_DISCORD_ATTACHMENT_BYTES: usize = 9 * 1024 * 1024;
+const MAX_REALTIME_AUDIO_BYTES: usize = MAX_DISCORD_ATTACHMENT_BYTES - 44;
+const MAX_REALTIME_AUDIO_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_REALTIME_AUDIO_CHUNK_BASE64: usize = MAX_REALTIME_AUDIO_CHUNK_BYTES.div_ceil(3) * 4;
+const PENDING_REQUEST_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct RealtimeDigest {
+    message_id: Option<u64>,
+    segments: Vec<(String, String)>,
+    partial_role: Option<String>,
+    partial: String,
+    version: Option<String>,
+    close_reason: Option<String>,
+    active: bool,
+    failed: bool,
+    dirty: bool,
+    audio: Vec<u8>,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<u16>,
+    audio_truncated: bool,
+}
+
+#[derive(Default)]
+struct OperationsDigest {
+    message_id: Option<u64>,
+    entries: Vec<(String, String)>,
+    dirty: bool,
+}
+
+impl OperationsDigest {
+    fn upsert(&mut self, item_id: &str, summary: String) {
+        if let Some((_, existing)) = self
+            .entries
+            .iter_mut()
+            .find(|(existing_id, _)| existing_id == item_id)
+        {
+            if *existing != summary {
+                *existing = summary;
+                self.dirty = true;
+            }
+            return;
+        }
+        self.entries.push((item_id.to_owned(), summary));
+        if self.entries.len() > 6 {
+            self.entries.remove(0);
+        }
+        self.dirty = true;
+    }
+
+    fn summaries(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|(_, summary)| summary.clone())
+            .collect()
+    }
+}
+
+impl RealtimeDigest {
+    fn start(&mut self, version: Option<&str>) {
+        self.segments.clear();
+        self.partial.clear();
+        self.partial_role = None;
+        self.audio.clear();
+        self.audio_sample_rate = None;
+        self.audio_channels = None;
+        self.audio_truncated = false;
+        self.active = true;
+        self.failed = false;
+        self.version = version.map(str::to_owned);
+        self.close_reason = None;
+        self.dirty = true;
+    }
+
+    fn append_transcript(&mut self, role: &str, delta: &str) {
+        if !self.active {
+            return;
+        }
+        if self.partial_role.as_deref() != Some(role) {
+            if !self.partial.is_empty() {
+                let previous_role = self.partial_role.as_deref().unwrap_or("unknown").to_owned();
+                let previous_text = std::mem::take(&mut self.partial);
+                self.finish_transcript(previous_role, previous_text);
+            }
+            self.partial_role = Some(role.to_owned());
+        }
+        append_bounded(&mut self.partial, delta, MAX_REALTIME_TRANSCRIPT_CHARS);
+        self.dirty = true;
+    }
+
+    fn finish_transcript(&mut self, role: String, text: String) {
+        let text = truncate_chars(&text, 4_000);
+        if !text.is_empty() {
+            let replace = self
+                .segments
+                .iter_mut()
+                .rev()
+                .find(|(existing_role, existing_text)| {
+                    existing_role == &role
+                        && (text.starts_with(existing_text.as_str())
+                            || existing_text.starts_with(text.as_str()))
+                });
+            if let Some((_, existing_text)) = replace {
+                *existing_text = text;
+            } else {
+                self.segments.push((role.clone(), text));
+            }
+            if self.segments.len() > 20 {
+                self.segments.remove(0);
+            }
+        }
+        if self.partial_role.as_deref() == Some(role.as_str()) {
+            self.partial.clear();
+            self.partial_role = None;
+        }
+        self.dirty = true;
+    }
+
+    fn close(&mut self, reason: Option<&str>) {
+        if !self.partial.is_empty() {
+            let role = self.partial_role.as_deref().unwrap_or("unknown").to_owned();
+            let text = std::mem::take(&mut self.partial);
+            self.finish_transcript(role, text);
+        }
+        self.active = false;
+        if let Some(reason) = reason {
+            self.close_reason = Some(truncate_chars(reason, 300));
+        }
+        self.dirty = true;
+    }
+
+    fn append_audio(&mut self, params: &Value) {
+        if !self.active || self.audio_truncated {
+            return;
+        }
+        let Some(audio) = params.get("audio") else {
+            return;
+        };
+        let Some(data) = audio.get("data").and_then(Value::as_str) else {
+            return;
+        };
+        let sample_rate = audio
+            .get("sampleRate")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let channels = audio
+            .get("numChannels")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok());
+        let samples_per_channel = audio
+            .get("samplesPerChannel")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok());
+        if data.len() > MAX_REALTIME_AUDIO_CHUNK_BASE64
+            || !sample_rate.is_some_and(|value| (8_000..=96_000).contains(&value))
+            || !channels.is_some_and(|value| (1..=2).contains(&value))
+            || self
+                .audio_sample_rate
+                .is_some_and(|value| Some(value) != sample_rate)
+            || self
+                .audio_channels
+                .is_some_and(|value| Some(value) != channels)
+        {
+            self.audio_truncated = true;
+            return;
+        }
+        let Ok(bytes) = BASE64_STANDARD.decode(data) else {
+            self.audio_truncated = true;
+            return;
+        };
+        let Some(block_align) = channels.map(|value| usize::from(value) * 2) else {
+            self.audio_truncated = true;
+            return;
+        };
+        let declared_len = samples_per_channel.and_then(|samples| samples.checked_mul(block_align));
+        if bytes.len() > MAX_REALTIME_AUDIO_CHUNK_BYTES
+            || bytes.len() % block_align != 0
+            || declared_len.is_some_and(|expected| expected != bytes.len())
+        {
+            self.audio_truncated = true;
+            return;
+        }
+        if self.audio.len().saturating_add(bytes.len()) > MAX_REALTIME_AUDIO_BYTES {
+            self.audio_truncated = true;
+            return;
+        }
+        self.audio_sample_rate = sample_rate;
+        self.audio_channels = channels;
+        self.audio.extend_from_slice(&bytes);
+    }
+
+    fn transcript_text(&self) -> String {
+        let mut text = String::new();
+        for (role, segment) in &self.segments {
+            append_transcript_segment(&mut text, role, segment);
+        }
+        if !self.partial.is_empty() {
+            append_transcript_segment(
+                &mut text,
+                self.partial_role.as_deref().unwrap_or("live"),
+                &self.partial,
+            );
+        }
+        truncate_chars(&text, 3_900)
+    }
+
+    fn take_wav(&mut self) -> Option<(Vec<u8>, bool)> {
+        let sample_rate = self.audio_sample_rate.take()?;
+        let channels = self.audio_channels.take()?;
+        if self.audio.is_empty() {
+            return None;
+        }
+        let pcm = std::mem::take(&mut self.audio);
+        let truncated = std::mem::take(&mut self.audio_truncated);
+        build_pcm16_wav(pcm, sample_rate, channels).map(|wav| (wav, truncated))
+    }
+}
+
+fn append_bounded(target: &mut String, delta: &str, max_chars: usize) {
+    let remaining = max_chars.saturating_sub(target.chars().count());
+    target.extend(delta.chars().take(remaining));
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_owned()
+    } else {
+        format!(
+            "{}…",
+            value
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
+
+fn append_transcript_segment(target: &mut String, role: &str, text: &str) {
+    if !target.is_empty() {
+        target.push_str("\n\n");
+    }
+    target.push_str("**");
+    target.push_str(&truncate_chars(role, 40));
+    target.push_str(":** ");
+    target.push_str(text);
+}
+
+fn build_pcm16_wav(pcm: Vec<u8>, sample_rate: u32, channels: u16) -> Option<Vec<u8>> {
+    let data_len = u32::try_from(pcm.len()).ok()?;
+    let block_align = channels.checked_mul(2)?;
+    let byte_rate = sample_rate.checked_mul(u32::from(block_align))?;
+    let riff_len = 36_u32.checked_add(data_len)?;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    Some(wav)
 }
 
 #[derive(Clone)]
@@ -334,9 +611,15 @@ struct BotState {
     streams: Mutex<HashMap<String, StreamBuffer>>,
     activity: Mutex<HashMap<String, ActivityDigest>>,
     plans: Mutex<HashMap<String, PlanBoard>>,
+    realtime: Mutex<HashMap<String, RealtimeDigest>>,
+    projection: Mutex<ProjectionCore>,
+    operations: Mutex<HashMap<String, OperationsDigest>>,
+    delivered_media: dashmap::DashSet<String>,
     ingestion_locks: dashmap::DashMap<u64, Arc<Mutex<()>>>,
     pending_server_requests: dashmap::DashMap<String, ServerRequest>,
+    pending_request_started: dashmap::DashMap<String, std::time::Instant>,
     pending_request_messages: dashmap::DashMap<String, (u64, u64)>,
+    resolved_request_tombstones: dashmap::DashMap<String, std::time::Instant>,
     action_drafts: dashmap::DashMap<String, ActionDraft>,
     task_browsers: dashmap::DashMap<String, TaskBrowserDraft>,
     plugin_browsers: dashmap::DashMap<String, PluginBrowserDraft>,
@@ -940,6 +1223,16 @@ impl Handler {
                         .components(fields),
                     ),
                 )
+                .await?;
+        } else if let Some(value) = components::custom_id_arg(id, components::APPROVE_OFFERED) {
+            let (request_id, index) = value
+                .rsplit_once(':')
+                .context("offered approval control is malformed")?;
+            let index = index
+                .parse::<usize>()
+                .context("invalid offered decision index")?;
+            let decision = format!("offered:{index}");
+            self.resolve_approval(&ctx.http, &component, request_id, &decision)
                 .await?;
         } else if let Some((decision, request_id)) = parse_approval_component(id) {
             self.resolve_approval(&ctx.http, &component, request_id, decision)
@@ -2259,6 +2552,19 @@ impl Handler {
         request_id: &str,
         decision: &str,
     ) -> Result<()> {
+        let offered_index = decision
+            .strip_prefix("offered:")
+            .map(str::parse::<usize>)
+            .transpose()
+            .context("invalid offered approval index")?;
+        anyhow::ensure!(
+            offered_index.is_some()
+                || matches!(
+                    decision,
+                    "accept" | "acceptForSession" | "decline" | "cancel"
+                ),
+            "unknown approval decision"
+        );
         component
             .create_response(http, CreateInteractionResponse::Acknowledge)
             .await?;
@@ -2267,6 +2573,7 @@ impl Handler {
             .pending_server_requests
             .remove(request_id)
             .context("request expired; wait for Codex to ask again")?;
+        self.state.pending_request_started.remove(request_id);
         let card = self
             .state
             .pending_request_messages
@@ -2276,75 +2583,131 @@ impl Handler {
         let method = ServerRequestMethod::classify(&request.method);
         let reply = match method {
             ServerRequestMethod::CommandExecutionApproval
-            | ServerRequestMethod::FileChangeApproval => requests::approval_reply(
-                &request,
-                match decision {
-                    "accept" => ApprovalDecision::Accept,
-                    "acceptForSession" => ApprovalDecision::AcceptForSession,
-                    _ => ApprovalDecision::Decline,
-                },
-            )?,
-            ServerRequestMethod::LegacyApplyPatchApproval
-            | ServerRequestMethod::LegacyExecCommandApproval => requests::legacy_approval_reply(
-                &request,
-                match decision {
-                    "accept" => LegacyApprovalDecision::Approved,
-                    "acceptForSession" => LegacyApprovalDecision::ApprovedForSession,
-                    _ => LegacyApprovalDecision::Denied,
-                },
-            )?,
-            ServerRequestMethod::PermissionsApproval => {
-                let permissions = if decision == "decline" {
-                    serde_json::Map::new()
+            | ServerRequestMethod::FileChangeApproval => {
+                if let Some(index) = offered_index {
+                    requests::approval_reply_from_offered(&request, index)?
                 } else {
-                    request
-                        .params
-                        .get("permissions")
-                        .and_then(Value::as_object)
-                        .cloned()
-                        .unwrap_or_default()
+                    requests::approval_reply(
+                        &request,
+                        match decision {
+                            "accept" => ApprovalDecision::Accept,
+                            "acceptForSession" => ApprovalDecision::AcceptForSession,
+                            "decline" => ApprovalDecision::Decline,
+                            "cancel" => ApprovalDecision::Cancel,
+                            _ => unreachable!("decision validated above"),
+                        },
+                    )?
+                }
+            }
+            ServerRequestMethod::LegacyApplyPatchApproval
+            | ServerRequestMethod::LegacyExecCommandApproval => {
+                anyhow::ensure!(
+                    offered_index.is_none(),
+                    "legacy approval has no offered index"
+                );
+                requests::legacy_approval_reply(
+                    &request,
+                    match decision {
+                        "accept" => LegacyApprovalDecision::Approved,
+                        "acceptForSession" => LegacyApprovalDecision::ApprovedForSession,
+                        "decline" => LegacyApprovalDecision::Denied,
+                        "cancel" => LegacyApprovalDecision::Abort,
+                        _ => unreachable!("decision validated above"),
+                    },
+                )?
+            }
+            ServerRequestMethod::PermissionsApproval => {
+                anyhow::ensure!(
+                    offered_index.is_none(),
+                    "permission approval has no offered index"
+                );
+                let (permissions, scope) = match decision {
+                    "decline" | "cancel" => (serde_json::Map::new(), PermissionScope::Turn),
+                    "accept" => (
+                        request
+                            .params
+                            .get("permissions")
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default(),
+                        PermissionScope::Turn,
+                    ),
+                    "acceptForSession" => (
+                        request
+                            .params
+                            .get("permissions")
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default(),
+                        PermissionScope::Session,
+                    ),
+                    _ => unreachable!("decision validated above"),
                 };
                 requests::permissions_reply(
                     &request,
                     PermissionGrant {
                         permissions,
-                        scope: if decision == "acceptForSession" {
-                            PermissionScope::Session
-                        } else {
-                            PermissionScope::Turn
-                        },
+                        scope,
                         strict_auto_review: None,
                     },
                 )?
             }
             ServerRequestMethod::McpElicitation => {
-                if decision == "decline" {
-                    requests::mcp_elicitation_reply(&request, McpElicitationAction::Decline, None)?
-                } else if decision == "cancel" {
-                    requests::mcp_elicitation_reply(&request, McpElicitationAction::Cancel, None)?
-                } else if request.params.get("mode").and_then(Value::as_str) == Some("url") {
-                    requests::mcp_elicitation_reply(&request, McpElicitationAction::Accept, None)?
-                } else if mcp_elicitation_has_empty_form_schema(&request) {
-                    requests::mcp_elicitation_reply(
+                anyhow::ensure!(offered_index.is_none(), "MCP approval has no offered index");
+                match decision {
+                    "decline" => requests::mcp_elicitation_reply(
                         &request,
-                        McpElicitationAction::Accept,
-                        Some(json!({})),
-                    )?
-                } else {
-                    anyhow::bail!("MCP form requires an answer before it can be accepted")
+                        McpElicitationAction::Decline,
+                        None,
+                    )?,
+                    "cancel" => requests::mcp_elicitation_reply(
+                        &request,
+                        McpElicitationAction::Cancel,
+                        None,
+                    )?,
+                    "accept"
+                        if request.params.get("mode").and_then(Value::as_str) == Some("url") =>
+                    {
+                        requests::mcp_elicitation_reply(
+                            &request,
+                            McpElicitationAction::Accept,
+                            None,
+                        )?
+                    }
+                    "accept" if mcp_elicitation_has_empty_form_schema(&request) => {
+                        requests::mcp_elicitation_reply(
+                            &request,
+                            McpElicitationAction::Accept,
+                            Some(json!({})),
+                        )?
+                    }
+                    "accept" => {
+                        anyhow::bail!("MCP form requires an answer before it can be accepted")
+                    }
+                    "acceptForSession" => {
+                        anyhow::bail!("MCP elicitation has no session-wide acceptance")
+                    }
+                    _ => unreachable!("decision validated above"),
                 }
             }
-            ServerRequestMethod::ToolUserInput => ServerReply::Error {
-                id: request.id.clone(),
-                error: RpcErrorObject {
-                    code: -32_000,
-                    message: "user declined the Discord input request".to_owned(),
-                    data: None,
-                },
-            },
+            ServerRequestMethod::ToolUserInput => {
+                anyhow::ensure!(offered_index.is_none(), "user input has no offered index");
+                anyhow::ensure!(
+                    matches!(decision, "decline" | "cancel"),
+                    "typed user input must be answered through its form"
+                );
+                ServerReply::Error {
+                    id: request.id.clone(),
+                    error: RpcErrorObject {
+                        code: -32_000,
+                        message: "user declined the Discord input request".to_owned(),
+                        data: None,
+                    },
+                }
+            }
             _ => requests::unsupported_reply(&request),
         };
-        if let Err(error) = send_server_reply(&self.state.codex, reply).await {
+        if let Err(error) = send_server_reply(&self.state.codex, request.generation, reply).await {
             restore_pending_request(&self.state, request_id, &request, Some(card));
             component
                 .channel_id
@@ -2359,9 +2722,8 @@ impl Handler {
                 .await?;
             return Err(error);
         }
-        self.state.store.remove_pending_request(request_id).await?;
-        if let Some(thread_id) = request_thread_id(&request) {
-            reactivate_unblocked_task(&self.state, http, &thread_id).await?;
+        if let Err(error) = self.state.store.remove_pending_request(request_id).await {
+            warn!(request_id, %error, "resolved pending request row could not be removed");
         }
         component
             .channel_id
@@ -2372,16 +2734,27 @@ impl Handler {
                     .embed(
                         CreateEmbed::new()
                             .title("Request resolved")
-                            .description(format!("Decision: **{decision}**"))
-                            .color(if matches!(decision, "decline" | "cancel") {
-                                0xED4245
+                            .description(if offered_index.is_some() {
+                                "Decision: **server-offered policy choice**".to_owned()
                             } else {
-                                0x57F287
-                            }),
+                                format!("Decision: **{decision}**")
+                            })
+                            .color(
+                                if offered_index.is_none()
+                                    && matches!(decision, "decline" | "cancel")
+                                {
+                                    0xED4245
+                                } else {
+                                    0x57F287
+                                },
+                            ),
                     )
                     .components(Vec::new()),
             )
             .await?;
+        if let Some(thread_id) = request_thread_id(&request) {
+            reactivate_unblocked_task(&self.state, http, &thread_id).await?;
+        }
         Ok(())
     }
 
@@ -2397,6 +2770,7 @@ impl Handler {
             .pending_server_requests
             .remove(token)
             .context("request expired; wait for Codex to ask again")?;
+        self.state.pending_request_started.remove(token);
         let card = self
             .state
             .pending_request_messages
@@ -2426,13 +2800,12 @@ impl Handler {
                 return Err(error);
             }
         };
-        if let Err(error) = send_server_reply(&self.state.codex, reply).await {
+        if let Err(error) = send_server_reply(&self.state.codex, request.generation, reply).await {
             restore_pending_request(&self.state, token, &request, card);
             return Err(error);
         }
-        self.state.store.remove_pending_request(token).await?;
-        if let Some(thread_id) = request_thread_id(&request) {
-            reactivate_unblocked_task(&self.state, http, &thread_id).await?;
+        if let Err(error) = self.state.store.remove_pending_request(token).await {
+            warn!(token, %error, "answered pending request row could not be removed");
         }
         if let Some((channel_id, message_id)) = card.or_else(|| {
             modal
@@ -2454,6 +2827,9 @@ impl Handler {
                         .components(Vec::new()),
                 )
                 .await?;
+        }
+        if let Some(thread_id) = request_thread_id(&request) {
+            reactivate_unblocked_task(&self.state, http, &thread_id).await?;
         }
         modal
             .edit_response(
@@ -4422,9 +4798,15 @@ pub async fn run() -> Result<()> {
         streams: Mutex::new(HashMap::new()),
         activity: Mutex::new(HashMap::new()),
         plans: Mutex::new(HashMap::new()),
+        realtime: Mutex::new(HashMap::new()),
+        projection: Mutex::new(ProjectionCore::new()),
+        operations: Mutex::new(HashMap::new()),
+        delivered_media: dashmap::DashSet::new(),
         ingestion_locks: dashmap::DashMap::new(),
         pending_server_requests: dashmap::DashMap::new(),
+        pending_request_started: dashmap::DashMap::new(),
         pending_request_messages: dashmap::DashMap::new(),
+        resolved_request_tombstones: dashmap::DashMap::new(),
         action_drafts: dashmap::DashMap::new(),
         task_browsers: dashmap::DashMap::new(),
         plugin_browsers: dashmap::DashMap::new(),
@@ -4739,7 +5121,28 @@ fn spawn_codex_listeners(state: Arc<BotState>, http: Arc<Http>) {
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    warn!(count, "Codex notification consumer lagged")
+                    warn!(count, "Codex notification consumer lagged");
+                    {
+                        let mut projection = notification_state.projection.lock().await;
+                        projection.mark_all_threads_lagged();
+                        projection.mark_connection_lagged();
+                    }
+                    {
+                        let mut realtime = notification_state.realtime.lock().await;
+                        for digest in realtime.values_mut().filter(|digest| digest.active) {
+                            digest.audio_truncated = true;
+                            digest.dirty = true;
+                        }
+                    }
+                    let mut operations = notification_state.operations.lock().await;
+                    for digest in operations.values_mut() {
+                        for (_, summary) in &mut digest.entries {
+                            if !summary.contains("stream lagged") {
+                                summary.push_str(" · ⚠ stream lagged");
+                            }
+                        }
+                        digest.dirty = true;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -4807,6 +5210,15 @@ fn spawn_stream_flusher(state: Arc<BotState>, http: Arc<Http>) {
             }
             if let Err(error) = flush_plans(&state, &http).await {
                 warn!(%error, "plan flush failed");
+            }
+            if let Err(error) = flush_realtime(&state, &http).await {
+                warn!(%error, "realtime transcript flush failed");
+            }
+            if let Err(error) = flush_operations(&state, &http).await {
+                warn!(%error, "live operations flush failed");
+            }
+            if let Err(error) = expire_live_pending_requests(&state, &http).await {
+                warn!(%error, "pending request expiry sweep failed");
             }
         }
     });
@@ -5375,6 +5787,19 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
             return Ok(());
         }
         NotificationDisposition::HighVolumeStream => return Ok(()),
+        NotificationDisposition::OperationProgress => {
+            update_operation_progress(state, &event).await;
+            return Ok(());
+        }
+        NotificationDisposition::StandaloneOutput => {
+            project_standalone_output(state, &event).await;
+            return Ok(());
+        }
+        NotificationDisposition::StandaloneLifecycle => {
+            project_standalone_completion(state, &event).await;
+            persist_notification_audit(state, &event, None).await?;
+            return Ok(());
+        }
         NotificationDisposition::PlanUpdated => {
             persist_notification_audit(state, &event, thread_id).await?;
             if let Some(thread_id) = thread_id {
@@ -5404,6 +5829,10 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
                         .or_default()
                         .complete_item(item_id, text);
                 }
+                if event.method == "item/completed" {
+                    complete_operation_item(state, thread_id, item).await;
+                    deliver_completed_media(state, http, thread_id, item).await?;
+                }
                 if let Some(line) = embeds::describe_item(item, event.method == "item/completed") {
                     let mut activity = state.activity.lock().await;
                     let digest = activity.entry(thread_id.to_owned()).or_default();
@@ -5416,6 +5845,79 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
             }
             return Ok(());
         }
+        NotificationDisposition::RealtimeTranscript => {
+            let Some(thread_id) = thread_id else {
+                return Ok(());
+            };
+            let role = event
+                .params
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("realtime");
+            {
+                let mut realtime = state.realtime.lock().await;
+                let digest = realtime.entry(thread_id.to_owned()).or_default();
+                if !digest.active {
+                    return Ok(());
+                } else if event.method == "thread/realtime/transcript/done" {
+                    let text = event
+                        .params
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    digest.finish_transcript(role.to_owned(), text.to_owned());
+                } else if let Some(delta) = event.params.get("delta").and_then(Value::as_str) {
+                    digest.append_transcript(role, delta);
+                }
+            }
+            if event.method == "thread/realtime/transcript/done" {
+                persist_notification_audit(state, &event, Some(thread_id)).await?;
+                flush_realtime(state, http).await?;
+            }
+            return Ok(());
+        }
+        NotificationDisposition::RealtimeAudio => {
+            if let Some(thread_id) = thread_id {
+                state
+                    .realtime
+                    .lock()
+                    .await
+                    .entry(thread_id.to_owned())
+                    .or_default()
+                    .append_audio(&event.params);
+            }
+            return Ok(());
+        }
+        NotificationDisposition::RealtimeLifecycle => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            let Some(thread_id) = thread_id else {
+                return Ok(());
+            };
+            let audio = {
+                let mut realtime = state.realtime.lock().await;
+                let digest = realtime.entry(thread_id.to_owned()).or_default();
+                if event.method == "thread/realtime/started" {
+                    digest.start(event.params.get("version").and_then(Value::as_str));
+                    None
+                } else if event.method == "thread/realtime/error" {
+                    digest.failed = true;
+                    if let Some(message) = event.params.get("message").and_then(Value::as_str) {
+                        digest.close_reason = Some(truncate_chars(message, 300));
+                    }
+                    digest.dirty = true;
+                    None
+                } else {
+                    let reason = event.params.get("reason").and_then(Value::as_str);
+                    digest.close(reason);
+                    digest.take_wav()
+                }
+            };
+            flush_realtime(state, http).await?;
+            if let Some((wav, truncated)) = audio {
+                deliver_realtime_audio(state, http, thread_id, wav, truncated).await?;
+            }
+            return Ok(());
+        }
         NotificationDisposition::TokenUsage => {
             persist_notification_audit(state, &event, thread_id).await?;
             if let Some(thread_id) = thread_id
@@ -5423,13 +5925,12 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
             {
                 task.last_event_at = Some(Utc::now());
                 state.store.upsert_task(&task).await?;
-                refresh_task_card(http, &task, Some("Token usage updated.")).await?;
             }
             return Ok(());
         }
         NotificationDisposition::RequestResolved => {
             persist_notification_audit(state, &event, thread_id).await?;
-            retire_resolved_request(state, http, &event.params).await?;
+            retire_resolved_request(state, http, &event).await?;
             return Ok(());
         }
         NotificationDisposition::RunnerStatus => {
@@ -5566,6 +6067,17 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
     }
     refresh_task_card(http, &task, None).await?;
     refresh_runner_status(state, http).await?;
+    if matches!(
+        event.method.as_str(),
+        "thread/archived" | "thread/closed" | "thread/deleted"
+    ) {
+        state.realtime.lock().await.remove(thread_id);
+        state.operations.lock().await.remove(thread_id);
+        let media_prefix = format!("{thread_id}:");
+        state
+            .delivered_media
+            .retain(|key| !key.starts_with(&media_prefix));
+    }
     Ok(())
 }
 
@@ -5678,11 +6190,107 @@ fn restore_pending_request(
     state
         .pending_server_requests
         .insert(token.to_owned(), request.clone());
+    state
+        .pending_request_started
+        .entry(token.to_owned())
+        .or_insert_with(std::time::Instant::now);
     if let Some(card) = card {
         state
             .pending_request_messages
             .insert(token.to_owned(), card);
     }
+}
+
+fn expired_server_reply(request: &ServerRequest) -> ServerReply {
+    match ServerRequestMethod::classify(&request.method) {
+        ServerRequestMethod::CommandExecutionApproval | ServerRequestMethod::FileChangeApproval => {
+            requests::approval_reply(request, ApprovalDecision::Cancel)
+                .unwrap_or_else(|_| requests::unsupported_reply(request))
+        }
+        ServerRequestMethod::LegacyApplyPatchApproval
+        | ServerRequestMethod::LegacyExecCommandApproval => {
+            requests::legacy_approval_reply(request, LegacyApprovalDecision::TimedOut)
+                .unwrap_or_else(|_| requests::unsupported_reply(request))
+        }
+        ServerRequestMethod::McpElicitation => {
+            requests::mcp_elicitation_reply(request, McpElicitationAction::Cancel, None)
+                .unwrap_or_else(|_| requests::unsupported_reply(request))
+        }
+        ServerRequestMethod::PermissionsApproval => requests::permissions_reply(
+            request,
+            PermissionGrant {
+                permissions: serde_json::Map::new(),
+                scope: PermissionScope::Turn,
+                strict_auto_review: None,
+            },
+        )
+        .unwrap_or_else(|_| requests::unsupported_reply(request)),
+        ServerRequestMethod::ToolUserInput => ServerReply::Error {
+            id: request.id.clone(),
+            error: RpcErrorObject {
+                code: -32_000,
+                message: "Discord input request expired".to_owned(),
+                data: None,
+            },
+        },
+        _ => requests::unsupported_reply(request),
+    }
+}
+
+async fn expire_live_pending_requests(state: &BotState, http: &Http) -> Result<()> {
+    let now = std::time::Instant::now();
+    let expired = state
+        .pending_request_started
+        .iter()
+        .filter(|entry| now.duration_since(*entry.value()) >= PENDING_REQUEST_TTL)
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    for token in expired {
+        state.pending_request_started.remove(&token);
+        let Some((_, request)) = state.pending_server_requests.remove(&token) else {
+            continue;
+        };
+        let card = state
+            .pending_request_messages
+            .remove(&token)
+            .map(|(_, card)| card);
+        if let Err(error) = send_server_reply(
+            &state.codex,
+            request.generation,
+            expired_server_reply(&request),
+        )
+        .await
+        {
+            warn!(token, %error, "expired Codex request could not be answered");
+        }
+        if let Err(error) = state.store.remove_pending_request(&token).await {
+            warn!(token, %error, "expired pending request row could not be removed");
+        }
+        if let Some((channel_id, message_id)) = card {
+            ChannelId::new(channel_id)
+                .edit_message(
+                    http,
+                    message_id,
+                    EditMessage::new()
+                        .embed(embeds::error_card(
+                            "Request expired",
+                            "Codex did not receive a decision within 15 minutes.",
+                        ))
+                        .components(Vec::new()),
+                )
+                .await
+                .ok();
+        }
+        if let Some(thread_id) = request_thread_id(&request)
+            && let Err(error) = reactivate_unblocked_task(state, http, &thread_id).await
+        {
+            warn!(thread_id, %error, "expired request task could not be reactivated");
+        }
+    }
+    state
+        .pending_request_started
+        .retain(|token, _| state.pending_server_requests.contains_key(token));
+    Ok(())
 }
 
 /// After a pending server request is answered or retired, put the task back
@@ -5707,11 +6315,15 @@ async fn reactivate_unblocked_task(state: &BotState, http: &Http, thread_id: &st
     Ok(())
 }
 
-async fn retire_resolved_request(state: &BotState, http: &Http, params: &Value) -> Result<()> {
-    let Some(rpc_id) = params.get("requestId") else {
+async fn retire_resolved_request(
+    state: &BotState,
+    http: &Http,
+    event: &Notification,
+) -> Result<()> {
+    let Some(rpc_id) = event.params.get("requestId") else {
         return Ok(());
     };
-    let thread_id = crate::codex::thread_id_from_params(params);
+    let thread_id = crate::codex::thread_id_from_params(&event.params);
     let token = state
         .pending_server_requests
         .iter()
@@ -5721,8 +6333,18 @@ async fn retire_resolved_request(state: &BotState, http: &Http, params: &Value) 
                     .is_none_or(|id| request_thread_id(entry.value()).as_deref() == Some(id))
         })
         .map(|entry| entry.key().clone());
-    let Some(token) = token else { return Ok(()) };
+    let Some(token) = token else {
+        let now = std::time::Instant::now();
+        state
+            .resolved_request_tombstones
+            .retain(|_, created| now.duration_since(*created) < Duration::from_secs(5 * 60));
+        state
+            .resolved_request_tombstones
+            .insert(resolved_request_key(event.generation, rpc_id), now);
+        return Ok(());
+    };
     state.pending_server_requests.remove(&token);
+    state.pending_request_started.remove(&token);
     let card = state
         .pending_request_messages
         .remove(&token)
@@ -5747,6 +6369,13 @@ async fn retire_resolved_request(state: &BotState, http: &Http, params: &Value) 
         reactivate_unblocked_task(state, http, thread_id).await?;
     }
     Ok(())
+}
+
+fn resolved_request_key(generation: u64, rpc_id: &Value) -> String {
+    format!(
+        "{generation}:{}",
+        serde_json::to_string(rpc_id).unwrap_or_else(|_| "invalid".to_owned())
+    )
 }
 
 async fn refresh_runner_status(state: &BotState, http: &Http) -> Result<()> {
@@ -5862,8 +6491,12 @@ async fn reject_server_request_setup(
     failure: ServerRequestSetupFailure,
     cause: Option<anyhow::Error>,
 ) -> Result<()> {
-    let reply =
-        send_server_reply(client, server_request_setup_failure_reply(request, failure)).await;
+    let reply = send_server_reply(
+        client,
+        request.generation,
+        server_request_setup_failure_reply(request, failure),
+    )
+    .await;
     match (cause, reply) {
         (None, Ok(())) => Ok(()),
         (None, Err(reply_error)) => Err(reply_error),
@@ -5881,18 +6514,52 @@ async fn handle_server_request(
     request: ServerRequest,
 ) -> Result<()> {
     if let Some(reply) = state.host_broker.handle_request(&request).await {
-        send_server_reply(&state.codex, reply).await?;
+        send_server_reply(&state.codex, request.generation, reply).await?;
         return Ok(());
     }
     if let Some(reply) = requests::immediate_reply(&request, Utc::now().timestamp()) {
-        send_server_reply(&state.codex, reply).await?;
+        send_server_reply(&state.codex, request.generation, reply).await?;
+        return Ok(());
+    }
+    if matches!(
+        ServerRequestMethod::classify(&request.method),
+        ServerRequestMethod::CommandExecutionApproval | ServerRequestMethod::FileChangeApproval
+    ) && requests::offered_approval_decisions(&request)
+        .is_some_and(|decisions| decisions.is_empty())
+    {
+        send_server_reply(
+            &state.codex,
+            request.generation,
+            ServerReply::Error {
+                id: request.id.clone(),
+                error: RpcErrorObject {
+                    code: -32_602,
+                    message: "app-server offered no supported approval decisions".to_owned(),
+                    data: None,
+                },
+            },
+        )
+        .await?;
         return Ok(());
     }
     let thread_id = crate::codex::thread_id_from_params(&request.params);
     let Some(thread_id) = thread_id else {
-        send_server_reply(&state.codex, requests::unsupported_reply(&request)).await?;
+        send_server_reply(
+            &state.codex,
+            request.generation,
+            requests::unsupported_reply(&request),
+        )
+        .await?;
         return Ok(());
     };
+    let resolution_key = resolved_request_key(request.generation, &request.id);
+    if state
+        .resolved_request_tombstones
+        .remove(&resolution_key)
+        .is_some()
+    {
+        return Ok(());
+    }
     let mut task = match state.store.task(thread_id).await {
         Ok(Some(task)) => task,
         Ok(None) => {
@@ -5949,6 +6616,20 @@ async fn handle_server_request(
     state
         .pending_server_requests
         .insert(request_id.clone(), request.clone());
+    state
+        .pending_request_started
+        .insert(request_id.clone(), std::time::Instant::now());
+    if state
+        .resolved_request_tombstones
+        .remove(&resolution_key)
+        .is_some()
+        || !state.pending_server_requests.contains_key(&request_id)
+    {
+        state.pending_server_requests.remove(&request_id);
+        state.pending_request_started.remove(&request_id);
+        state.store.remove_pending_request(&request_id).await?;
+        return Ok(());
+    }
     task.state = TaskState::NeedsUser;
     task.last_event_at = Some(Utc::now());
     if let Err(error) = state.store.upsert_task(&task).await {
@@ -5977,6 +6658,15 @@ async fn handle_server_request(
         ServerRequestMethod::ToolUserInput | ServerRequestMethod::McpElicitation => {
             components::answer_buttons(&request_id)
         }
+        ServerRequestMethod::CommandExecutionApproval | ServerRequestMethod::FileChangeApproval
+            if requests::offered_approval_decisions(&request).is_some() =>
+        {
+            let choices = requests::offered_approval_decisions(&request)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|decision| (decision.index, decision.label));
+            components::offered_approval_buttons(&request_id, choices)
+        }
         _ => components::approval_buttons(&request_id),
     };
     let sent = match channel
@@ -5992,6 +6682,7 @@ async fn handle_server_request(
         Ok(message) => message,
         Err(error) => {
             state.pending_server_requests.remove(&request_id);
+            state.pending_request_started.remove(&request_id);
             if let Err(cleanup_error) = state.store.remove_pending_request(&request_id).await {
                 warn!(request_id, %cleanup_error, "failed Discord request left a persisted pending row");
             }
@@ -6007,6 +6698,25 @@ async fn handle_server_request(
     state
         .pending_request_messages
         .insert(request_id.clone(), (channel.get(), sent.id.get()));
+    if !state.pending_server_requests.contains_key(&request_id) {
+        state.pending_request_messages.remove(&request_id);
+        state.store.remove_pending_request(&request_id).await?;
+        channel
+            .edit_message(
+                http,
+                sent.id,
+                EditMessage::new()
+                    .embed(embeds::info_card(
+                        "Resolved in Codex Desktop",
+                        "This request was answered from another Codex client.",
+                    ))
+                    .components(Vec::new()),
+            )
+            .await
+            .ok();
+        reactivate_unblocked_task(state, http, thread_id).await?;
+        return Ok(());
+    }
     if let Err(error) = state
         .store
         .set_pending_request_message(&request_id, channel.get(), sent.id.get())
@@ -6017,12 +6727,375 @@ async fn handle_server_request(
     Ok(())
 }
 
+async fn project_standalone_output(state: &BotState, event: &Notification) {
+    let process_id = event
+        .params
+        .get("processId")
+        .or_else(|| event.params.get("processHandle"))
+        .and_then(Value::as_str);
+    let Some(process_id) = process_id else {
+        return;
+    };
+    let Some(delta) = event.params.get("deltaBase64").and_then(Value::as_str) else {
+        return;
+    };
+    let stream = if event.params.get("stream").and_then(Value::as_str) == Some("stderr") {
+        OutputStream::Stderr
+    } else {
+        OutputStream::Stdout
+    };
+    if let Err(error) = state.projection.lock().await.push_process_output(
+        process_id,
+        stream,
+        OutputChunk::base64(delta),
+    ) {
+        warn!(
+            process_id,
+            ?error,
+            "standalone process projection rejected a chunk"
+        );
+    }
+}
+
+async fn project_standalone_completion(state: &BotState, event: &Notification) {
+    let Some(process_id) = event
+        .params
+        .get("processHandle")
+        .or_else(|| event.params.get("processId"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let exit_code = event
+        .params
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let completion = exit_code.map_or(CompletionState::Unknown, |code| {
+        if code == 0 {
+            CompletionState::Succeeded
+        } else {
+            CompletionState::Failed
+        }
+    });
+    let stdout = event
+        .params
+        .get("stdout")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(OutputChunk::utf8);
+    let stderr = event
+        .params
+        .get("stderr")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(OutputChunk::utf8);
+    if let Err(error) = state
+        .projection
+        .lock()
+        .await
+        .complete_process(process_id, completion, exit_code, stdout, stderr)
+    {
+        warn!(
+            process_id,
+            ?error,
+            "standalone process completion projection failed"
+        );
+    }
+}
+
+async fn update_operation_progress(state: &BotState, event: &Notification) {
+    let Some(thread_id) = crate::codex::thread_id_from_params(&event.params) else {
+        return;
+    };
+    let Some(item_id) = event.params.get("itemId").and_then(Value::as_str) else {
+        return;
+    };
+    let summary = {
+        let mut projection = state.projection.lock().await;
+        match event.method.as_str() {
+            "item/commandExecution/outputDelta" => {
+                let Some(delta) = event.params.get("delta").and_then(Value::as_str) else {
+                    return;
+                };
+                if let Err(error) = projection.push_command_output(
+                    thread_id,
+                    item_id,
+                    OutputStream::Stdout,
+                    OutputChunk::utf8(delta),
+                ) {
+                    warn!(
+                        thread_id,
+                        item_id,
+                        ?error,
+                        "command output projection rejected a chunk"
+                    );
+                }
+                projection
+                    .command(thread_id, item_id)
+                    .map(format_command_projection)
+            }
+            "item/mcpToolCall/progress" => {
+                let Some(message) = event.params.get("message").and_then(Value::as_str) else {
+                    return;
+                };
+                if let Err(error) = projection.push_mcp_progress(thread_id, item_id, message) {
+                    warn!(
+                        thread_id,
+                        item_id,
+                        ?error,
+                        "MCP progress projection rejected an update"
+                    );
+                }
+                projection
+                    .mcp(thread_id, item_id)
+                    .map(format_mcp_projection)
+            }
+            "item/fileChange/outputDelta" | "item/fileChange/patchUpdated" => {
+                let files = projection_u32(&event.params, &["filesChanged", "fileCount"]);
+                let applied = projection_u32(&event.params, &["hunksApplied", "completedHunks"]);
+                let total = projection_u32(&event.params, &["hunksTotal", "totalHunks"]);
+                if let Err(error) = projection.update_patch(
+                    thread_id,
+                    item_id,
+                    PatchState::Running,
+                    files,
+                    applied,
+                    total,
+                    false,
+                ) {
+                    warn!(
+                        thread_id,
+                        item_id,
+                        ?error,
+                        "patch projection rejected an update"
+                    );
+                }
+                projection
+                    .patch(thread_id, item_id)
+                    .map(format_patch_projection)
+            }
+            _ => None,
+        }
+    };
+    if let Some(summary) = summary {
+        state
+            .operations
+            .lock()
+            .await
+            .entry(thread_id.to_owned())
+            .or_default()
+            .upsert(item_id, summary);
+    }
+}
+
+async fn complete_operation_item(state: &BotState, thread_id: &str, item: &Value) {
+    let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let completion = completion_state(item.get("status").and_then(Value::as_str));
+    let summary = {
+        let mut projection = state.projection.lock().await;
+        match item_type {
+            "commandExecution" => {
+                let exit_code = item
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok());
+                let authoritative = item
+                    .get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .map(OutputChunk::utf8);
+                if let Err(error) = projection.complete_command(
+                    thread_id,
+                    item_id,
+                    completion,
+                    exit_code,
+                    authoritative,
+                    None,
+                ) {
+                    warn!(
+                        thread_id,
+                        item_id,
+                        ?error,
+                        "command completion projection failed"
+                    );
+                }
+                projection
+                    .command(thread_id, item_id)
+                    .map(format_command_projection)
+            }
+            "mcpToolCall" => {
+                let authoritative = item.pointer("/error/message").and_then(Value::as_str);
+                if let Err(error) =
+                    projection.complete_mcp(thread_id, item_id, completion, authoritative)
+                {
+                    warn!(
+                        thread_id,
+                        item_id,
+                        ?error,
+                        "MCP completion projection failed"
+                    );
+                }
+                projection
+                    .mcp(thread_id, item_id)
+                    .map(format_mcp_projection)
+            }
+            "fileChange" => {
+                let files = item
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .and_then(|changes| u32::try_from(changes.len()).ok());
+                let state_value = match completion {
+                    CompletionState::Succeeded => PatchState::Applied,
+                    CompletionState::Cancelled => PatchState::Cancelled,
+                    CompletionState::Failed | CompletionState::Unknown => PatchState::Failed,
+                };
+                if let Err(error) = projection.update_patch(
+                    thread_id,
+                    item_id,
+                    state_value,
+                    files,
+                    None,
+                    None,
+                    true,
+                ) {
+                    warn!(
+                        thread_id,
+                        item_id,
+                        ?error,
+                        "patch completion projection failed"
+                    );
+                }
+                projection
+                    .patch(thread_id, item_id)
+                    .map(format_patch_projection)
+            }
+            _ => None,
+        }
+    };
+    if let Some(summary) = summary {
+        state
+            .operations
+            .lock()
+            .await
+            .entry(thread_id.to_owned())
+            .or_default()
+            .upsert(item_id, summary);
+    }
+}
+
+fn completion_state(status: Option<&str>) -> CompletionState {
+    match status.unwrap_or_default() {
+        "completed" | "success" | "succeeded" => CompletionState::Succeeded,
+        "cancelled" | "canceled" | "declined" | "aborted" => CompletionState::Cancelled,
+        "failed" | "error" => CompletionState::Failed,
+        _ => CompletionState::Unknown,
+    }
+}
+
+fn projection_u32(params: &Value, keys: &[&str]) -> Option<u32> {
+    keys.iter().find_map(|key| {
+        params
+            .get(*key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+    })
+}
+
+fn format_command_projection(command: &crate::discord::projection::CommandProjection) -> String {
+    let icon = if command.active {
+        "⏳"
+    } else if command.completion == Some(CompletionState::Succeeded) {
+        "✅"
+    } else {
+        "❌"
+    };
+    let mut output = String::new();
+    if !command.output.stdout.is_empty() {
+        output.push_str(&command.output.stdout);
+    }
+    if !command.output.stderr.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&command.output.stderr);
+    }
+    let output = truncate_chars(&output.replace('`', "ˋ"), 700);
+    let markers = operation_markers(
+        command.output.capped,
+        command.output.incomplete,
+        command.output.lagged,
+    );
+    if output.is_empty() {
+        format!("{icon} **Command** · waiting for output{markers}")
+    } else {
+        format!("{icon} **Command**{markers}\n```text\n{output}\n```")
+    }
+}
+
+fn format_mcp_projection(progress: &crate::discord::projection::McpProgressProjection) -> String {
+    let icon = if progress.active {
+        "🧰"
+    } else if progress.completion == Some(CompletionState::Succeeded) {
+        "✅"
+    } else {
+        "❌"
+    };
+    let latest = progress
+        .messages
+        .back()
+        .map_or("Waiting for tool progress", String::as_str);
+    let markers = operation_markers(false, progress.incomplete, progress.lagged);
+    format!(
+        "{icon} **MCP tool** · {}{markers}",
+        truncate_chars(latest, 600)
+    )
+}
+
+fn format_patch_projection(patch: &crate::discord::projection::PatchProjection) -> String {
+    let icon = match patch.state {
+        PatchState::Running => "📝",
+        PatchState::Applied => "✅",
+        PatchState::Failed | PatchState::Cancelled => "❌",
+    };
+    let counts = match (patch.hunks_applied, patch.hunks_total, patch.files_changed) {
+        (Some(applied), Some(total), _) => format!(" · {applied}/{total} hunks"),
+        (_, _, Some(files)) => format!(" · {files} files"),
+        _ => String::new(),
+    };
+    let markers = operation_markers(false, patch.incomplete, patch.lagged);
+    format!("{icon} **File changes**{counts}{markers}")
+}
+
+fn operation_markers(capped: bool, incomplete: bool, lagged: bool) -> String {
+    let mut markers = Vec::new();
+    if capped {
+        markers.push("truncated");
+    }
+    if incomplete {
+        markers.push("incomplete");
+    }
+    if lagged {
+        markers.push("stream lagged");
+    }
+    if markers.is_empty() {
+        String::new()
+    } else {
+        format!(" · ⚠ {}", markers.join(", "))
+    }
+}
+
 async fn flush_activity(state: &BotState, http: &Http) -> Result<()> {
     flush_digests(
         state,
         http,
         &state.activity,
         |digest| std::mem::take(&mut digest.dirty).then(|| embeds::activity_card(&digest.lines)),
+        |digest| digest.dirty = true,
         |digest| &mut digest.message_id,
     )
     .await
@@ -6034,9 +7107,323 @@ async fn flush_plans(state: &BotState, http: &Http) -> Result<()> {
         http,
         &state.plans,
         |board| std::mem::take(&mut board.dirty).then(|| embeds::plan_card(&board.params)),
+        |board| board.dirty = true,
         |board| &mut board.message_id,
     )
     .await
+}
+
+async fn flush_operations(state: &BotState, http: &Http) -> Result<()> {
+    flush_digests(
+        state,
+        http,
+        &state.operations,
+        |digest| {
+            std::mem::take(&mut digest.dirty)
+                .then(|| embeds::live_operations_card(&digest.summaries()))
+        },
+        |digest| digest.dirty = true,
+        |digest| &mut digest.message_id,
+    )
+    .await
+}
+
+async fn flush_realtime(state: &BotState, http: &Http) -> Result<()> {
+    flush_digests(
+        state,
+        http,
+        &state.realtime,
+        |digest| {
+            std::mem::take(&mut digest.dirty).then(|| {
+                embeds::realtime_card(
+                    &digest.transcript_text(),
+                    digest.active,
+                    digest.failed,
+                    digest.version.as_deref(),
+                    digest.close_reason.as_deref(),
+                )
+            })
+        },
+        |digest| digest.dirty = true,
+        |digest| &mut digest.message_id,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct ImageFormat {
+    extension: &'static str,
+}
+
+async fn deliver_completed_media(
+    state: &BotState,
+    _http: &Http,
+    thread_id: &str,
+    item: &Value,
+) -> Result<()> {
+    let Some(item_type @ ("imageGeneration" | "imageView")) =
+        item.get("type").and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| stable_value_hash(item));
+    let delivery_key = format!("{thread_id}:{item_id}");
+    if !state.delivered_media.insert(delivery_key.clone()) {
+        return Ok(());
+    }
+
+    let result = async {
+        let Some(task) = state.store.task(thread_id).await? else {
+            return Ok(false);
+        };
+        let Some(channel_id) = task.channel_id else {
+            return Ok(false);
+        };
+        let Some((bytes, format)) = load_completed_image(&task, item, item_type).await else {
+            warn!(
+                thread_id,
+                item_id, "generated image had no safe bounded attachment source"
+            );
+            return Ok(false);
+        };
+        let filename = format!("codex-generated.{}", format.extension);
+        let status =
+            item.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or(if item_type == "imageView" {
+                    "viewed"
+                } else {
+                    "completed"
+                });
+        let successful = matches!(status, "completed" | "viewed" | "success" | "succeeded");
+        let title = match (item_type, successful) {
+            ("imageView", _) => "🖼️ Codex viewed an image",
+            (_, true) => "🖼️ Codex generated an image",
+            _ => "🖼️ Image generation did not complete",
+        };
+        let mut description = format!(
+            "Status: `{}` · {} KiB",
+            truncate_chars(status, 40),
+            bytes.len().div_ceil(1024)
+        );
+        if let Some(prompt) = item.get("revisedPrompt").and_then(Value::as_str) {
+            description.push_str("\n\n**Revised prompt**\n");
+            description.push_str(&truncate_chars(prompt, 500));
+        }
+        enqueue_media_attachment(
+            state,
+            &format!("media:{thread_id}:{item_id}"),
+            channel_id,
+            title,
+            &description,
+            if successful { 0x0057_F287 } else { 0x00ED_4245 },
+            &filename,
+            true,
+            bytes,
+        )
+        .await?;
+        Ok::<_, anyhow::Error>(true)
+    }
+    .await;
+
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            state.delivered_media.remove(&delivery_key);
+            Ok(())
+        }
+        Err(error) => {
+            state.delivered_media.remove(&delivery_key);
+            Err(error)
+        }
+    }
+}
+
+async fn load_completed_image(
+    task: &TaskMirror,
+    item: &Value,
+    item_type: &str,
+) -> Option<(Vec<u8>, ImageFormat)> {
+    if let Some(cwd) = task.cwd.as_deref() {
+        let path = if item_type == "imageView" {
+            item.get("path").and_then(Value::as_str)
+        } else {
+            item.get("savedPath").and_then(Value::as_str)
+        };
+        if let Some(path) = path
+            && let Some(image) = read_workspace_image(Path::new(cwd), Path::new(path)).await
+        {
+            return Some(image);
+        }
+    }
+    (item_type == "imageGeneration")
+        .then(|| item.get("result").and_then(Value::as_str))
+        .flatten()
+        .and_then(decode_inline_image)
+}
+
+async fn read_workspace_image(
+    workspace: &Path,
+    candidate: &Path,
+) -> Option<(Vec<u8>, ImageFormat)> {
+    if !workspace.is_absolute() || !candidate.is_absolute() {
+        return None;
+    }
+    let workspace = tokio::fs::canonicalize(workspace).await.ok()?;
+    let candidate = tokio::fs::canonicalize(candidate).await.ok()?;
+    if !candidate.starts_with(&workspace) {
+        return None;
+    }
+    let mut file = tokio::fs::File::open(&candidate).await.ok()?;
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() || metadata.len() > u64::try_from(MAX_DISCORD_ATTACHMENT_BYTES).ok()? {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    (&mut file)
+        .take(u64::try_from(MAX_DISCORD_ATTACHMENT_BYTES + 1).ok()?)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    validate_image_bytes(bytes)
+}
+
+fn decode_inline_image(result: &str) -> Option<(Vec<u8>, ImageFormat)> {
+    let encoded = if let Some(data_url) = result.strip_prefix("data:") {
+        let (metadata, encoded) = data_url.split_once(',')?;
+        if !metadata.ends_with(";base64") || !metadata.starts_with("image/") {
+            return None;
+        }
+        encoded
+    } else {
+        // The installed Codex schema permits raw base64 here. URLs and paths
+        // fail strict base64 decoding and are deliberately never fetched/read.
+        result
+    };
+    let max_encoded = MAX_DISCORD_ATTACHMENT_BYTES.div_ceil(3) * 4 + 4;
+    if encoded.is_empty() || encoded.len() > max_encoded {
+        return None;
+    }
+    let bytes = BASE64_STANDARD.decode(encoded).ok()?;
+    validate_image_bytes(bytes)
+}
+
+fn validate_image_bytes(bytes: Vec<u8>) -> Option<(Vec<u8>, ImageFormat)> {
+    if bytes.is_empty() || bytes.len() > MAX_DISCORD_ATTACHMENT_BYTES {
+        return None;
+    }
+    let extension = if bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.len() >= 4 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "jpg"
+    } else if bytes.len() >= 13 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        "gif"
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return None;
+    };
+    Some((bytes, ImageFormat { extension }))
+}
+
+async fn deliver_realtime_audio(
+    state: &BotState,
+    _http: &Http,
+    thread_id: &str,
+    wav: Vec<u8>,
+    truncated: bool,
+) -> Result<()> {
+    let Some(task) = state.store.task(thread_id).await? else {
+        return Ok(());
+    };
+    let Some(channel_id) = task.channel_id else {
+        return Ok(());
+    };
+    let note = if truncated {
+        "The session exceeded Relay's bounded audio buffer; this attachment contains the retained prefix."
+    } else {
+        "Complete realtime audio captured from Codex."
+    };
+    let content_hash = stable_bytes_hash(&wav);
+    enqueue_media_attachment(
+        state,
+        &format!("realtime-audio:{thread_id}:{content_hash}"),
+        channel_id,
+        "🔊 Realtime audio",
+        note,
+        if truncated { 0x00FE_E75C } else { 0x0057_F287 },
+        "codex-realtime.wav",
+        false,
+        wav,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_media_attachment(
+    state: &BotState,
+    dedupe_key: &str,
+    channel_id: u64,
+    title: &str,
+    description: &str,
+    color: u32,
+    filename: &str,
+    display_image: bool,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_DISCORD_ATTACHMENT_BYTES,
+        "media attachment exceeds Relay's safe upload limit"
+    );
+    anyhow::ensure!(
+        safe_media_name(filename),
+        "media attachment filename is unsafe"
+    );
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let spool_name = format!("{}.{}", stable_value_hash(&json!(dedupe_key)), extension);
+    let spool_root = config::data_dir().join("outbox-media");
+    tokio::fs::create_dir_all(&spool_root).await?;
+    let spool_path = spool_root.join(&spool_name);
+    if !spool_path.exists() {
+        let temporary = spool_root.join(format!("{spool_name}.tmp"));
+        tokio::fs::write(&temporary, &bytes).await?;
+        match tokio::fs::rename(&temporary, &spool_path).await {
+            Ok(()) => {}
+            Err(error) if spool_path.exists() => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                drop(error);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if let Err(error) = state
+        .store
+        .enqueue_outbox(
+            dedupe_key,
+            channel_id,
+            "media_attachment",
+            &json!({
+                "file": spool_name,
+                "filename": filename,
+                "title": truncate_chars(title, 256),
+                "description": truncate_chars(description, 2_000),
+                "color": color,
+                "display_image": display_image
+            }),
+        )
+        .await
+    {
+        let _ = tokio::fs::remove_file(spool_path).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Shared per-task digest delivery: snapshot dirty embeds, edit the existing
@@ -6046,6 +7433,7 @@ async fn flush_digests<T>(
     http: &Http,
     digests: &Mutex<HashMap<String, T>>,
     mut take_dirty: impl FnMut(&mut T) -> Option<CreateEmbed>,
+    mut mark_dirty: impl FnMut(&mut T),
     message_id: impl Fn(&mut T) -> &mut Option<u64>,
 ) -> Result<()> {
     let pending: Vec<(String, CreateEmbed, Option<u64>)> = {
@@ -6058,14 +7446,26 @@ async fn flush_digests<T>(
     };
     for (thread_id, embed, existing) in pending {
         let Some(task) = state.store.task(&thread_id).await? else {
+            if let Some(digest) = digests.lock().await.get_mut(&thread_id) {
+                mark_dirty(digest);
+            }
             continue;
         };
         let Some(channel) = task.channel_id.map(ChannelId::new) else {
+            if let Some(digest) = digests.lock().await.get_mut(&thread_id) {
+                mark_dirty(digest);
+            }
             continue;
         };
         let delivered = if let Some(existing) = existing {
             match channel
-                .edit_message(http, existing, EditMessage::new().embed(embed.clone()))
+                .edit_message(
+                    http,
+                    existing,
+                    EditMessage::new()
+                        .embed(embed.clone())
+                        .allowed_mentions(CreateAllowedMentions::new()),
+                )
                 .await
             {
                 Ok(_) => Some(existing),
@@ -6075,7 +7475,11 @@ async fn flush_digests<T>(
             send_digest_message(http, channel, embed).await
         };
         if let Some(digest) = digests.lock().await.get_mut(&thread_id) {
-            *message_id(digest) = delivered;
+            if let Some(delivered) = delivered {
+                *message_id(digest) = Some(delivered);
+            } else {
+                mark_dirty(digest);
+            }
         }
     }
     Ok(())
@@ -6083,7 +7487,12 @@ async fn flush_digests<T>(
 
 async fn send_digest_message(http: &Http, channel: ChannelId, embed: CreateEmbed) -> Option<u64> {
     match channel
-        .send_message(http, CreateMessage::new().embed(embed))
+        .send_message(
+            http,
+            CreateMessage::new()
+                .embed(embed)
+                .allowed_mentions(CreateAllowedMentions::new()),
+        )
         .await
     {
         Ok(message) => Some(message.id.get()),
@@ -6195,6 +7604,21 @@ fn final_answer_message(
     (embed, buttons, attachment)
 }
 
+fn safe_media_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && !value.starts_with('.')
+        && !value.contains("..")
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+}
+
+fn media_outbox_path(payload: &Value) -> Option<PathBuf> {
+    let file = payload.get("file").and_then(Value::as_str)?;
+    safe_media_name(file).then(|| config::data_dir().join("outbox-media").join(file))
+}
+
 fn spawn_outbox_flusher(state: Arc<BotState>, http: Arc<Http>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -6243,6 +7667,71 @@ fn spawn_outbox_flusher(state: Arc<BotState>, http: Arc<Http>) {
                             }
                         }
                     }
+                    "media_attachment" => {
+                        async {
+                            let path = media_outbox_path(&row.payload)
+                                .ok_or(serenity::Error::Other("media outbox path is invalid"))?;
+                            let metadata = tokio::fs::metadata(&path).await.map_err(|_| {
+                                serenity::Error::Other("media outbox file is missing")
+                            })?;
+                            if !metadata.is_file()
+                                || metadata.len()
+                                    > u64::try_from(MAX_DISCORD_ATTACHMENT_BYTES)
+                                        .unwrap_or(u64::MAX)
+                            {
+                                Err(serenity::Error::Other("media outbox file is invalid"))?
+                            }
+                            let bytes = tokio::fs::read(&path).await.map_err(|_| {
+                                serenity::Error::Other("media outbox file is unreadable")
+                            })?;
+                            let filename = row
+                                .payload
+                                .get("filename")
+                                .and_then(Value::as_str)
+                                .filter(|filename| safe_media_name(filename))
+                                .unwrap_or("codex-media.bin");
+                            let title = row
+                                .payload
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex media");
+                            let description = row
+                                .payload
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex produced a media attachment.");
+                            let color = row
+                                .payload
+                                .get("color")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok())
+                                .unwrap_or(0x0057_F287);
+                            let mut embed = CreateEmbed::new()
+                                .title(truncate_chars(title, 256))
+                                .description(truncate_chars(description, 2_000))
+                                .color(color)
+                                .timestamp(serenity::model::Timestamp::now());
+                            if row
+                                .payload
+                                .get("display_image")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                embed = embed.image(format!("attachment://{filename}"));
+                            }
+                            channel
+                                .send_message(
+                                    &http,
+                                    CreateMessage::new()
+                                        .embed(embed)
+                                        .allowed_mentions(CreateAllowedMentions::new())
+                                        .add_file(CreateAttachment::bytes(bytes, filename)),
+                                )
+                                .await
+                                .map(|_| ())
+                        }
+                        .await
+                    }
                     // An unknown kind must not be acked as delivered: a row
                     // written by a newer relay build should survive until that
                     // build processes it, or dead-letter after the retry cap.
@@ -6256,6 +7745,10 @@ fn spawn_outbox_flusher(state: Arc<BotState>, http: Arc<Http>) {
                     Ok(()) => {
                         if let Err(error) = state.store.mark_outbox_sent(row.id).await {
                             warn!(row_id = row.id, %error, "outbox ack failed");
+                        } else if row.kind == "media_attachment"
+                            && let Some(path) = media_outbox_path(&row.payload)
+                        {
+                            let _ = tokio::fs::remove_file(path).await;
                         }
                     }
                     Err(error) => {
@@ -7206,10 +8699,22 @@ fn parse_approval_component(custom_id: &str) -> Option<(&'static str, &str)> {
     })
 }
 
-async fn send_server_reply(client: &CodexClient, reply: ServerReply) -> Result<()> {
+async fn send_server_reply(
+    client: &CodexClient,
+    generation: u64,
+    reply: ServerReply,
+) -> Result<()> {
     match reply {
-        ServerReply::Result { id, result } => client.respond_result(id, result).await?,
-        ServerReply::Error { id, error } => client.respond_error(id, error).await?,
+        ServerReply::Result { id, result } => {
+            client
+                .respond_result_for_generation(generation, id, result)
+                .await?
+        }
+        ServerReply::Error { id, error } => {
+            client
+                .respond_error_for_generation(generation, id, error)
+                .await?
+        }
     }
     Ok(())
 }
@@ -7494,6 +8999,13 @@ fn stable_value_hash(value: &Value) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.to_string().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn stable_bytes_hash(value: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -8107,8 +9619,8 @@ mod server_request_setup_tests {
     use serde_json::json;
 
     use super::{
-        ServerReply, ServerRequest, ServerRequestSetupFailure,
-        mcp_elicitation_has_empty_form_schema, server_answer_form,
+        ServerReply, ServerRequest, ServerRequestSetupFailure, expired_server_reply,
+        mcp_elicitation_has_empty_form_schema, resolved_request_key, server_answer_form,
         server_request_setup_failure_reply,
     };
 
@@ -8117,6 +9629,7 @@ mod server_request_setup_tests {
             id,
             method: "item/commandExecution/requestApproval".to_owned(),
             params: json!({"threadId":"thread-1"}),
+            generation: 1,
         }
     }
 
@@ -8160,6 +9673,58 @@ mod server_request_setup_tests {
     }
 
     #[test]
+    fn live_expiry_uses_each_protocols_terminal_response() {
+        for (method, expected) in [
+            (
+                "item/commandExecution/requestApproval",
+                json!({"decision":"cancel"}),
+            ),
+            ("execCommandApproval", json!({"decision":"timed_out"})),
+            ("mcpServer/elicitation/request", json!({"action":"cancel"})),
+            (
+                "item/permissions/requestApproval",
+                json!({"permissions":{},"scope":"turn"}),
+            ),
+        ] {
+            let request = ServerRequest {
+                id: json!(77),
+                method: method.to_owned(),
+                params: json!({"threadId":"thread-1"}),
+                generation: 1,
+            };
+            let ServerReply::Result { id, result } = expired_server_reply(&request) else {
+                panic!("{method} must expire with a result")
+            };
+            assert_eq!(id, json!(77));
+            assert_eq!(result, expected);
+        }
+
+        let input = ServerRequest {
+            id: json!(78),
+            method: "item/tool/requestUserInput".to_owned(),
+            params: json!({"threadId":"thread-1"}),
+            generation: 1,
+        };
+        let ServerReply::Error { id, error } = expired_server_reply(&input) else {
+            panic!("input expiry must be correlated error")
+        };
+        assert_eq!(id, json!(78));
+        assert_eq!(error.code, -32_000);
+    }
+
+    #[test]
+    fn resolved_request_tombstones_are_generation_and_id_scoped() {
+        assert_ne!(
+            resolved_request_key(1, &json!(77)),
+            resolved_request_key(2, &json!(77))
+        );
+        assert_ne!(
+            resolved_request_key(1, &json!(77)),
+            resolved_request_key(1, &json!("77"))
+        );
+    }
+
+    #[test]
     fn six_field_mcp_schema_uses_one_lossless_free_form_input() {
         let request = ServerRequest {
             id: json!("mcp-six"),
@@ -8177,6 +9742,7 @@ mod server_request_setup_tests {
                     }
                 }
             }),
+            generation: 1,
         };
 
         let rows = server_answer_form(&request)
@@ -8205,6 +9771,7 @@ mod server_request_setup_tests {
                     }
                 }
             }),
+            generation: 1,
         };
 
         let payload = serde_json::to_value(server_answer_form(&request).unwrap()).unwrap();
@@ -8221,6 +9788,7 @@ mod server_request_setup_tests {
                 "mode": "form",
                 "requestedSchema": {"type": "object", "properties": {}}
             }),
+            generation: 1,
         };
 
         assert!(mcp_elicitation_has_empty_form_schema(&request));
@@ -8287,5 +9855,211 @@ mod stream_tests {
         stream.complete_item("item-1", "same text");
         assert!(!stream.dirty, "no visible change to flush");
         assert_eq!(stream.text(), "same text");
+    }
+}
+
+#[cfg(test)]
+mod realtime_media_tests {
+    use base64::Engine as _;
+    use serde_json::json;
+
+    use super::{
+        BASE64_STANDARD, RealtimeDigest, decode_inline_image, media_outbox_path,
+        read_workspace_image, safe_media_name, validate_image_bytes,
+    };
+
+    fn minimal_png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(24, 0);
+        bytes
+    }
+
+    #[test]
+    fn realtime_transcript_done_replaces_partial_delta() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.append_transcript("assistant", "partial");
+        digest.finish_transcript("assistant".to_owned(), "authoritative final".to_owned());
+        let text = digest.transcript_text();
+        assert!(text.contains("authoritative final"));
+        assert!(!text.contains("partial"));
+    }
+
+    #[test]
+    fn pcm16_audio_is_validated_and_wrapped_as_wav() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.append_audio(&json!({
+            "audio": {
+                "data": BASE64_STANDARD.encode([1_u8, 0, 2, 0]),
+                "sampleRate": 24_000,
+                "numChannels": 1,
+                "samplesPerChannel": 2
+            }
+        }));
+        let (wav, truncated) = digest.take_wav().expect("valid PCM must produce WAV");
+        assert!(!truncated);
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
+        assert_eq!(&wav[44..], &[1, 0, 2, 0]);
+    }
+
+    #[test]
+    fn inconsistent_audio_sample_count_is_rejected() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.append_audio(&json!({
+            "audio": {
+                "data": BASE64_STANDARD.encode([1_u8, 0, 2, 0]),
+                "sampleRate": 24_000,
+                "numChannels": 1,
+                "samplesPerChannel": 9
+            }
+        }));
+        assert!(digest.audio.is_empty());
+        assert!(digest.audio_truncated);
+        assert!(digest.take_wav().is_none());
+    }
+
+    #[test]
+    fn rejected_audio_chunk_latches_to_a_clean_prefix() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.append_audio(&json!({"audio": {
+            "data": BASE64_STANDARD.encode([1_u8, 0]),
+            "sampleRate": 24_000,
+            "numChannels": 1,
+            "samplesPerChannel": 1
+        }}));
+        digest.append_audio(&json!({"audio": {
+            "data": BASE64_STANDARD.encode([9_u8, 0]),
+            "sampleRate": 24_000,
+            "numChannels": 1,
+            "samplesPerChannel": 99
+        }}));
+        digest.append_audio(&json!({"audio": {
+            "data": BASE64_STANDARD.encode([2_u8, 0]),
+            "sampleRate": 24_000,
+            "numChannels": 1,
+            "samplesPerChannel": 1
+        }}));
+        let (wav, truncated) = digest.take_wav().unwrap();
+        assert!(truncated);
+        assert_eq!(&wav[44..], &[1, 0]);
+    }
+
+    #[test]
+    fn interleaved_transcript_done_heals_without_destroying_other_role() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.append_transcript("user", "hello");
+        digest.append_transcript("assistant", "wor");
+        digest.finish_transcript("user".to_owned(), "hello".to_owned());
+        digest.append_transcript("assistant", "ld");
+        digest.finish_transcript("assistant".to_owned(), "world".to_owned());
+        let text = digest.transcript_text();
+        assert_eq!(text.matches("hello").count(), 1);
+        assert_eq!(text.matches("world").count(), 1);
+        assert!(!text.contains("wor\n"));
+    }
+
+    #[test]
+    fn close_without_reason_preserves_a_prior_realtime_error() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v3"));
+        digest.failed = true;
+        digest.close_reason = Some("provider disconnected".to_owned());
+        digest.close(None);
+        assert!(digest.failed);
+        assert_eq!(
+            digest.close_reason.as_deref(),
+            Some("provider disconnected")
+        );
+    }
+
+    #[test]
+    fn new_realtime_session_clears_stale_transcript_and_audio() {
+        let mut digest = RealtimeDigest::default();
+        digest.start(Some("v2"));
+        digest.append_transcript("assistant", "old transcript");
+        digest.append_audio(&json!({
+            "audio": {
+                "data": BASE64_STANDARD.encode([1_u8, 0]),
+                "sampleRate": 24_000,
+                "numChannels": 1,
+                "samplesPerChannel": 1
+            }
+        }));
+        digest.start(Some("v3"));
+        assert!(digest.transcript_text().is_empty());
+        assert!(digest.audio.is_empty());
+        assert_eq!(digest.version.as_deref(), Some("v3"));
+    }
+
+    #[test]
+    fn inline_images_require_base64_and_real_image_magic() {
+        let png = minimal_png();
+        let raw = BASE64_STANDARD.encode(&png);
+        assert_eq!(decode_inline_image(&raw).unwrap().1.extension, "png");
+        assert_eq!(
+            decode_inline_image(&format!("data:image/png;base64,{raw}"))
+                .unwrap()
+                .1
+                .extension,
+            "png"
+        );
+        assert!(decode_inline_image("https://example.test/image.png").is_none());
+        assert!(decode_inline_image("C:/private/image.png").is_none());
+        assert!(validate_image_bytes(b"not an image".to_vec()).is_none());
+    }
+
+    #[test]
+    fn media_outbox_names_cannot_escape_the_spool_directory() {
+        for rejected in [
+            "",
+            ".hidden",
+            "../secret",
+            "folder/file.png",
+            "folder\\file.png",
+            "C:secret.png",
+        ] {
+            assert!(
+                !safe_media_name(rejected),
+                "accepted unsafe name: {rejected}"
+            );
+            assert!(media_outbox_path(&json!({"file": rejected})).is_none());
+        }
+
+        let path = media_outbox_path(&json!({"file": "relay-image_42.png"}))
+            .expect("safe basename must map into the media spool");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("relay-image_42.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_images_cannot_escape_the_task_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_path = workspace.path().join("generated.png");
+        let outside_path = outside.path().join("private.png");
+        tokio::fs::write(&inside_path, minimal_png()).await.unwrap();
+        tokio::fs::write(&outside_path, minimal_png())
+            .await
+            .unwrap();
+
+        assert!(
+            read_workspace_image(workspace.path(), &inside_path)
+                .await
+                .is_some()
+        );
+        assert!(
+            read_workspace_image(workspace.path(), &outside_path)
+                .await
+                .is_none()
+        );
     }
 }

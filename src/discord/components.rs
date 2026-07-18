@@ -29,6 +29,7 @@ pub const APPROVE_ONCE: &str = "relay:approve_once";
 pub const APPROVE_SESSION: &str = "relay:approve_session";
 pub const DENY: &str = "relay:deny";
 pub const CANCEL_REQUEST: &str = "relay:cancel_request";
+pub const APPROVE_OFFERED: &str = "relay:approval_offer";
 pub const ANSWER_REQUEST: &str = "relay:answer_request";
 pub const NEW_TASK_MODAL: &str = "relay:new_task_modal";
 pub const GOD_MODAL: &str = "relay:god_modal";
@@ -272,7 +273,40 @@ pub fn approval_buttons(request_id: &str) -> Vec<CreateActionRow> {
         CreateButton::new(format!("{DENY}:{request_id}"))
             .label("Deny")
             .style(ButtonStyle::Danger),
+        CreateButton::new(format!("{CANCEL_REQUEST}:{request_id}"))
+            .label("Cancel and stop")
+            .style(ButtonStyle::Secondary),
     ])]
+}
+
+#[must_use]
+pub fn offered_approval_buttons(
+    request_id: &str,
+    choices: impl IntoIterator<Item = (usize, &'static str)>,
+) -> Vec<CreateActionRow> {
+    let buttons = choices
+        .into_iter()
+        .take(25)
+        .map(|(index, label)| {
+            let style = if label.starts_with("Decline") {
+                ButtonStyle::Danger
+            } else if label.starts_with("Cancel") {
+                ButtonStyle::Secondary
+            } else if label.contains("session") {
+                ButtonStyle::Primary
+            } else {
+                ButtonStyle::Success
+            };
+            CreateButton::new(format!("{APPROVE_OFFERED}:{request_id}:{index}"))
+                .label(label)
+                .style(style)
+        })
+        .collect::<Vec<_>>();
+    buttons
+        .chunks(5)
+        .take(5)
+        .map(|row| CreateActionRow::Buttons(row.to_vec()))
+        .collect()
 }
 
 #[must_use]
