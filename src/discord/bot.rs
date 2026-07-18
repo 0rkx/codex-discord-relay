@@ -3352,47 +3352,58 @@ impl Handler {
     async fn mcp_status(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
         self.require_installed_method("mcpServerStatus/list")?;
         defer_command(http, command).await?;
+        let view = string_command_option(command, "view").unwrap_or("servers");
+        let query = string_command_option(command, "query")
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_ascii_lowercase);
+        let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
         let thread_id = self
             .state
             .store
             .task_by_channel(command.channel_id.get())
             .await?
             .map(|task| task.thread_id);
-        let result = self
-            .state
-            .codex
-            .mcp_server_status_list(McpServerStatusListParams {
-                cursor: None,
-                limit: Some(25),
-                detail: Some("toolsAndAuthOnly".into()),
-                thread_id,
-            })
-            .await?;
-        let servers = first_result_array(&result, &["data", "items"]);
+        let servers = collect_mcp_servers(&self.state.codex, thread_id).await?;
+        let mut rows = mcp_catalog_rows(&servers, view)?;
+        if let Some(query) = query.as_deref() {
+            rows.retain(|row| {
+                [&row.primary, &row.secondary, &row.description]
+                    .into_iter()
+                    .any(|value| value.to_ascii_lowercase().contains(query))
+            });
+        }
+        rows.sort_by_key(|row| {
+            (
+                row.secondary.to_ascii_lowercase(),
+                row.primary.to_ascii_lowercase(),
+            )
+        });
+        let (start, end, page, pages) = page_window(rows.len(), requested_page, 10);
         let mut lines = String::new();
-        for server in servers.iter().take(25) {
-            let name = server.get("name").and_then(Value::as_str).unwrap_or("?");
-            let auth = match server.get("authStatus").and_then(Value::as_str) {
-                Some("notLoggedIn") => "🔒 not logged in",
-                Some("bearerToken") => "🔑 bearer token",
-                Some("oAuth") => "🔑 OAuth",
-                _ => "🟢 no auth needed",
-            };
-            let tools = server
-                .get("tools")
-                .and_then(Value::as_object)
-                .map(serde_json::Map::len)
-                .unwrap_or(0);
-            lines.push_str(&format!("**{name}** · {auth} · {tools} tool(s)\n"));
+        for row in &rows[start..end] {
+            lines.push_str(&format!(
+                "**{}** · {}\n   {}\n",
+                row.primary.chars().take(120).collect::<String>(),
+                row.secondary.chars().take(100).collect::<String>(),
+                row.description.chars().take(120).collect::<String>()
+            ));
         }
         if lines.is_empty() {
-            lines.push_str("No MCP servers are configured.");
+            lines.push_str("No matching MCP entries.");
         }
-        push_more_indicator(&mut lines, servers.len(), 25);
+        lines.push_str(&format!(
+            "\nPage {page}/{pages} · {} {}",
+            rows.len(),
+            mcp_view_label(view)
+        ));
         command
             .edit_response(
                 http,
-                EditInteractionResponse::new().embed(embeds::info_card("MCP servers", &lines)),
+                EditInteractionResponse::new().embed(embeds::info_card(
+                    &format!("MCP {}", mcp_view_label(view)),
+                    &lines,
+                )),
             )
             .await?;
         Ok(())
@@ -4258,7 +4269,30 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                 )
                 .required(false),
             ),
-        CommandBuilder::new("mcp").description("Show MCP server status, auth, and tool counts"),
+        CommandBuilder::new("mcp")
+            .description("Browse every MCP server, tool, resource, or template")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "view", "Catalog to browse")
+                    .add_string_choice("Servers", "servers")
+                    .add_string_choice("Tools", "tools")
+                    .add_string_choice("Resources", "resources")
+                    .add_string_choice("Resource templates", "templates")
+                    .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "query",
+                    "Filter by name, server, URI, or description",
+                )
+                .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::Integer, "page", "Result page")
+                    .min_int_value(1)
+                    .max_int_value(100)
+                    .required(false),
+            ),
         CommandBuilder::new("mode")
             .description("Choose a collaboration mode preset for new turns in this task"),
         CommandBuilder::new("effort")
@@ -6301,6 +6335,150 @@ async fn collect_apps(
     anyhow::bail!("Codex app/list exceeded {MAX_PAGES} pages")
 }
 
+async fn collect_mcp_servers(
+    client: &CodexClient,
+    thread_id: Option<String>,
+) -> Result<Vec<Value>> {
+    const PAGE_SIZE: u32 = 100;
+    const MAX_PAGES: usize = 100;
+
+    let mut servers = Vec::new();
+    let mut cursor = None;
+    for _ in 0..MAX_PAGES {
+        let result = client
+            .mcp_server_status_list(McpServerStatusListParams {
+                cursor: cursor.clone(),
+                limit: Some(PAGE_SIZE),
+                detail: Some("full".to_owned()),
+                thread_id: thread_id.clone(),
+            })
+            .await?;
+        servers.extend(
+            first_result_array(&result, &["data", "items"])
+                .iter()
+                .cloned(),
+        );
+        let next = result
+            .get("nextCursor")
+            .or_else(|| result.get("next_cursor"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if next.is_none() {
+            return Ok(servers);
+        }
+        anyhow::ensure!(
+            next != cursor,
+            "Codex mcpServerStatus/list returned a repeated cursor"
+        );
+        cursor = next;
+    }
+    anyhow::bail!("Codex mcpServerStatus/list exceeded {MAX_PAGES} pages")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpCatalogRow {
+    primary: String,
+    secondary: String,
+    description: String,
+}
+
+fn mcp_catalog_rows(servers: &[Value], view: &str) -> Result<Vec<McpCatalogRow>> {
+    anyhow::ensure!(
+        matches!(view, "servers" | "tools" | "resources" | "templates"),
+        "unknown MCP catalog view `{view}`"
+    );
+    let mut rows = Vec::new();
+    for server in servers {
+        let server_name = server
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unnamed server");
+        if view == "servers" {
+            let auth = match server.get("authStatus").and_then(Value::as_str) {
+                Some("notLoggedIn") => "not logged in",
+                Some("bearerToken") => "bearer token",
+                Some("oAuth") | Some("oauth") => "OAuth",
+                Some(status) => status,
+                None => "no auth needed",
+            };
+            rows.push(McpCatalogRow {
+                primary: server_name.to_owned(),
+                secondary: auth.to_owned(),
+                description: format!(
+                    "{} tools · {} resources · {} templates",
+                    mcp_collection_len(server.get("tools")),
+                    mcp_collection_len(server.get("resources")),
+                    mcp_collection_len(server.get("resourceTemplates"))
+                ),
+            });
+            continue;
+        }
+
+        let field = match view {
+            "tools" => "tools",
+            "resources" => "resources",
+            "templates" => "resourceTemplates",
+            _ => anyhow::bail!("unknown MCP catalog view `{view}`"),
+        };
+        for (fallback_name, item) in mcp_collection_items(server.get(field)) {
+            let primary = item
+                .get("name")
+                .or_else(|| item.get("title"))
+                .or_else(|| item.get("uri"))
+                .or_else(|| item.get("uriTemplate"))
+                .and_then(Value::as_str)
+                .unwrap_or(&fallback_name)
+                .to_owned();
+            let description = item
+                .get("description")
+                .or_else(|| item.get("uri"))
+                .or_else(|| item.get("uriTemplate"))
+                .and_then(Value::as_str)
+                .unwrap_or("No description supplied")
+                .replace('\n', " ");
+            rows.push(McpCatalogRow {
+                primary,
+                secondary: server_name.to_owned(),
+                description,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+fn mcp_collection_len(value: Option<&Value>) -> usize {
+    match value {
+        Some(Value::Array(items)) => items.len(),
+        Some(Value::Object(items)) => items.len(),
+        _ => 0,
+    }
+}
+
+fn mcp_collection_items(value: Option<&Value>) -> Vec<(String, &Value)> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (format!("item {}", index + 1), item))
+            .collect(),
+        Some(Value::Object(items)) => items
+            .iter()
+            .map(|(name, item)| (name.clone(), item))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn mcp_view_label(view: &str) -> &'static str {
+    match view {
+        "servers" => "servers",
+        "tools" => "tools",
+        "resources" => "resources",
+        "templates" => "resource templates",
+        _ => "entries",
+    }
+}
+
 fn first_result_array<'a>(value: &'a Value, keys: &[&str]) -> &'a [Value] {
     for key in keys {
         if let Some(values) = value.get(*key).and_then(Value::as_array) {
@@ -7150,7 +7328,7 @@ mod god_safety_tests {
 mod capability_list_tests {
     use serde_json::json;
 
-    use super::{collect_skills, model_reasoning_efforts, page_window};
+    use super::{collect_skills, mcp_catalog_rows, model_reasoning_efforts, page_window};
 
     #[test]
     fn current_grouped_skills_response_is_flattened() {
@@ -7190,6 +7368,41 @@ mod capability_list_tests {
             ]}
         ]});
         assert_eq!(model_reasoning_efforts(&result, "gpt-b"), ["high", "ultra"]);
+    }
+
+    #[test]
+    fn mcp_catalog_flattens_object_tools_and_array_resources() {
+        let servers = json!([{
+            "name":"codex_apps",
+            "authStatus":"bearerToken",
+            "tools":{
+                "gmail_search":{"name":"gmail_search","description":"Search Gmail"},
+                "gmail_send":{"description":"Send email"}
+            },
+            "resources":[
+                {"name":"inbox","uri":"gmail://inbox","description":"Inbox messages"}
+            ],
+            "resourceTemplates":[
+                {"name":"thread","uriTemplate":"gmail://thread/{id}"}
+            ]
+        }]);
+        let servers = servers.as_array().unwrap();
+
+        let tools = mcp_catalog_rows(servers, "tools").unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|row| {
+            row.primary == "gmail_send"
+                && row.secondary == "codex_apps"
+                && row.description == "Send email"
+        }));
+
+        let resources = mcp_catalog_rows(servers, "resources").unwrap();
+        assert_eq!(resources[0].primary, "inbox");
+        let templates = mcp_catalog_rows(servers, "templates").unwrap();
+        assert_eq!(templates[0].description, "gmail://thread/{id}");
+
+        let status = mcp_catalog_rows(servers, "servers").unwrap();
+        assert_eq!(status[0].description, "2 tools · 1 resources · 1 templates");
     }
 }
 

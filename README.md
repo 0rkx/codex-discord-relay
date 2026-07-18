@@ -38,7 +38,7 @@ Public documentation:
   file search), `/mode` (collaboration presets), and `/effort` (reasoning effort for new turns)
 - `/find` full-text search across every Codex task with snippets; results open directly into
   private task channels
-- `/mcp` shows configured MCP servers with auth state and tool counts
+- `/mcp` searches and paginates the complete MCP server, tool, resource, and resource-template catalogs
 - `/email` opens a native modal, attaches Gmail explicitly, and carries installation,
   authorization, approval, and send results through the Codex connector flow
 - Typed command/file/permission approvals plus question-specific user-input and MCP elicitation

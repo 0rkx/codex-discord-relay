@@ -67,6 +67,10 @@ New tasks start with `gpt-5.6-sol` and `medium` reasoning. `/model` changes mode
 `/effort` fetches the selected model's live reasoning-effort catalog for autocomplete and rejects
 values that model does not support; GPT-5.6 Sol currently exposes `low` through `ultra`.
 
+`/mcp` has searchable, paginated views for every configured server, tool, resource, and resource
+template. It fetches every Codex cursor with full detail instead of stopping at Discord's first
+25 choices.
+
 `/advanced` is task-bound, requires active GOD mode, validates JSON against the installed schema,
 and exists for developer recovery—not routine use.
 

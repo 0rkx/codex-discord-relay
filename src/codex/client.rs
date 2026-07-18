@@ -1581,6 +1581,40 @@ mod tests {
         client.close().await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires the locally installed Codex app-server"]
+    async fn live_mcp_full_catalog_has_browsable_entries() {
+        let client = CodexClient::discover().unwrap();
+        let result = client
+            .mcp_server_status_list(McpServerStatusListParams {
+                cursor: None,
+                limit: Some(100),
+                detail: Some("full".to_owned()),
+                thread_id: None,
+            })
+            .await
+            .unwrap();
+        let servers = result
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("mcpServerStatus/list returned no data array");
+        assert!(
+            !servers.is_empty(),
+            "installed Codex returned no MCP servers"
+        );
+        assert!(servers.iter().all(|server| server.get("name").is_some()));
+        assert!(
+            servers.iter().any(|server| {
+                server
+                    .get("tools")
+                    .and_then(Value::as_object)
+                    .is_some_and(|tools| !tools.is_empty())
+            }),
+            "full MCP detail returned no browsable tools"
+        );
+        client.close().await;
+    }
+
     #[cfg(windows)]
     #[test]
     #[ignore = "requires Codex Desktop"]
