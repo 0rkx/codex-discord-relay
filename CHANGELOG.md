@@ -17,16 +17,19 @@ stable public API is declared.
   app cache by default with an explicit `refresh:true` option (a fresh fetch takes ~60–90s),
   and `/apps scope:directory` keeps the full catalog browse.
 - `/email` verifies Gmail before dispatch and claims usability only on observed proof — app
-  accessibility or an actually mounted Gmail tool inventory; an installed plugin is
-  acknowledged as an unverified fact with the install link offered.
+  accessibility or an actually mounted Gmail send-tool inventory; an installed plugin is
+  acknowledged as an unverified fact with the install link offered. Accessible Gmail is sent to
+  Codex as a typed `mention` input instead of Markdown-shaped text.
 - `app/list` calls that fail with RPC -32600 "thread not found" for a stored task thread
   (stale after a Relay restart) retry once globally instead of failing the command.
 - Plugin detail embeds show humanized auth timing, non-default availability, and the ChatGPT
   apps a plugin drives; the plugin browser surfaces admin-disabled and policy-unavailable states.
 - Read-only live harness (`connectors::live_tests`) that validates the documented wire
   contract and overview classification against the locally installed Codex app-server,
-  printing only through the crate's central secret redaction plus a home-path scrub, and
-  asserting nothing machine-specific (Gmail checks run only where the plugin exists).
+  never prints local connector names, IDs, tools, accounts, or paths, and asserts nothing
+  machine-specific (Gmail checks run only where the plugin exists).
+- Installed-Codex model harnesses now prove a native `webSearch` item plus sourced answer and the
+  production existing-task resume path across a fresh app-server process and second turn.
 
 - Native Rust HostBroker with real `codex_app.list_threads` and `codex_app.read_thread` dynamic
   tools, bounded concurrent routing, rich activity rendering, and live-tested cold resume/fork
@@ -46,6 +49,8 @@ stable public API is declared.
   can-be-installed wording, and the plugin install state is a separate fact on the same row
   that never upgrades the app's accessibility.
 - `/apps` and `/email` no longer force a full app re-fetch (60–90s) on every invocation.
+- `/tasks` explicitly calls `thread/resume` before reopening a stored task, including when its
+  Discord channel already exists, preventing fresh app-server `thread not found` failures.
 - MCP servers with a missing `authStatus` are labeled "auth status unknown" instead of the
   invented "no auth needed", and `unsupported` renders as "no OAuth support".
 - Realtime audio now latches at the first rejected chunk instead of splicing later audio, preserves

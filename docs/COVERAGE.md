@@ -97,8 +97,10 @@ least:
 |---|---|
 | Setup | Fresh private guild provisions expected layout and commands |
 | New task | `/new` creates a Codex task and private mirror channel |
-| Existing task | `/tasks` reopens active and archived tasks |
+| Existing task | `/tasks` explicitly resumes active and archived tasks; a live cold-app-server test completes a second turn and retains the first |
 | Turn | Text and attachment reach Codex; final answer returns |
+| Web search | Real model turn emits a native `webSearch` item and returns the requested sourced answer |
+| Connector catalog | Live app/plugin/MCP wire data parses and classifies without logging local connector details |
 | Approval | Allow/deny response resolves the exact pending RPC request |
 | Dynamic HostBroker | Real model tool call completes nested app-server RPC; cold resume and fork retain tools |
 | User input | Modal response resumes the waiting turn |

@@ -775,8 +775,11 @@ mod tests {
 
     use crate::{
         codex::{
-            CodexCommand, ThreadForkParams, ThreadResumeParams, ThreadStartParams, TurnStartParams,
-            UserInput,
+            CodexCommand, ThreadForkParams, ThreadResumeParams, ThreadStartParams,
+            TurnInterruptParams, TurnStartParams, UserInput,
+        },
+        discord::bot::{
+            RELAY_DEFAULT_MODEL, RELAY_DEFAULT_REASONING_EFFORT, RELAY_DEVELOPER_INSTRUCTIONS,
         },
         models::{TaskMirror, TaskState},
     };
@@ -1187,6 +1190,107 @@ mod tests {
 
         client.thread_delete(thread_id).await.unwrap();
         client.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the locally installed Codex app-server, model access, and live web search"]
+    async fn live_web_search_turn_emits_native_search_and_sourced_answer() {
+        let client = CodexClient::discover().unwrap();
+        let mut notifications = client.subscribe_notifications();
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let thread = client
+            .thread_start(ThreadStartParams {
+                cwd: Some(cwd.clone()),
+                model: Some(RELAY_DEFAULT_MODEL.to_owned()),
+                approval_policy: Some("never".to_owned()),
+                sandbox: Some(json!("read-only")),
+                personality: None,
+                developer_instructions: Some(RELAY_DEVELOPER_INSTRUCTIONS.to_owned()),
+                runtime_workspace_roots: Some(vec![cwd.clone()]),
+                dynamic_tools: Some(HostBroker::dynamic_tool_specs()),
+                extra: BTreeMap::from([("config".to_owned(), json!({"web_search":"live"}))]),
+            })
+            .await
+            .unwrap();
+        let thread_id = thread["thread"]["id"].as_str().unwrap().to_owned();
+        let turn = client
+            .turn_start(TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![UserInput::text(
+                    "Use native web search now to find official OpenAI Codex documentation. Open an official source, then reply with LIVE_WEB_OK and one https:// source URL. Do not answer from memory.",
+                )],
+                cwd: Some(cwd),
+                model: Some(RELAY_DEFAULT_MODEL.to_owned()),
+                approval_policy: Some("never".to_owned()),
+                sandbox_policy: None,
+                extra: BTreeMap::from([(
+                    "effort".to_owned(),
+                    json!(RELAY_DEFAULT_REASONING_EFFORT),
+                )]),
+            })
+            .await
+            .unwrap();
+        let turn_id = turn["turn"]["id"].as_str().unwrap().to_owned();
+
+        let observed = timeout(Duration::from_secs(300), async {
+            let mut web_query = None;
+            let mut answer = None;
+            loop {
+                let event = notifications.recv().await.unwrap();
+                if event.params["threadId"] != thread_id {
+                    continue;
+                }
+                if event.method == "item/completed" && event.params["turnId"] == turn_id {
+                    let item = &event.params["item"];
+                    match item["type"].as_str() {
+                        Some("webSearch") => {
+                            web_query = item["query"].as_str().map(str::to_owned);
+                        }
+                        Some("agentMessage") => {
+                            let text = item["text"].as_str().unwrap_or_default();
+                            if text.contains("LIVE_WEB_OK") {
+                                answer = Some(text.to_owned());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if event.method == "turn/completed" && event.params["turn"]["id"] == turn_id {
+                    break (
+                        web_query,
+                        answer,
+                        event.params["turn"]["status"].as_str().map(str::to_owned),
+                    );
+                }
+            }
+        })
+        .await;
+
+        if observed.is_err() {
+            let _ = client
+                .turn_interrupt(TurnInterruptParams {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                })
+                .await;
+        }
+        let delete = client.thread_delete(thread_id).await;
+        client.close().await;
+
+        let (web_query, answer, status) = observed.expect("live web-search turn timed out");
+        delete.expect("live web-search test could not delete its task");
+        assert!(
+            web_query
+                .as_deref()
+                .is_some_and(|query| !query.trim().is_empty()),
+            "turn completed without a native webSearch item"
+        );
+        let answer = answer.expect("turn completed without the requested final marker");
+        assert!(
+            answer.contains("https://"),
+            "final answer did not contain a source URL"
+        );
+        assert_eq!(status.as_deref(), Some("completed"));
     }
 
     #[tokio::test]

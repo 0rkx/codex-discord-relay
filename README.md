@@ -50,9 +50,10 @@ Public documentation:
   asynchronously through real `dynamicTools` calls; calls are turn-bound, allowlisted, redacted,
   timeout-limited, and rendered in the activity embed
 - `/email` opens a native modal and verifies Gmail against observed state before dispatch:
-  usability is claimed only when the Gmail app is accessible or Gmail tools are actually
-  mounted; an installed plugin is acknowledged as an unverified fact, and the connector flow
-  carries installation, authorization, approval, and send results either way
+  usability is claimed only when the Gmail app is accessible or Gmail send tools are actually
+  mounted; an installed plugin is acknowledged as an unverified fact, accessible Gmail is passed
+  as a typed Codex app mention, and the connector flow carries installation, authorization,
+  approval, and send results either way
 - Typed command/file/permission approvals plus question-specific user-input and MCP elicitation
   controls; cards honor Codex `availableDecisions`, copy policy amendments only from the server,
   bind replies to the originating app-server process, and expire after 15 minutes
@@ -191,6 +192,10 @@ invokable through the generic compatibility fallback and are reported separately
 receive an audited spec or protocol-only classification. Methods absent from an older installed
 build fail fast with a clear capability message. Run `/capabilities` for the live routing numbers;
 use the live user-flow matrix for end-to-end UX evidence.
+
+The ignored installed-Codex suite separately executes real model turns for native web search,
+dynamic HostBroker calls, cold resume/fork inheritance, and the production `/tasks` resume path.
+It does not turn schema routing into a provider-side-effect claim.
 
 Every installed notification has an explicit semantic disposition; command/MCP/patch/realtime and
 task-bound standalone process streams use separate bounded projections, while goal, settings,

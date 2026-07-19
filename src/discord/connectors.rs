@@ -1,7 +1,7 @@
 //! Truthful connector-health model for Codex apps, plugins, and MCP servers.
 //!
 //! Wire sources, verified against the installed app-server schema dump, a live
-//! Codex 0.144.1 (2026-07-19), and the official openai/codex source:
+//! Codex app-server, and the official openai/codex source:
 //!
 //! - `app/list` (`AppInfo`) — the ChatGPT app directory. `isAccessible`
 //!   (schema default `false`) is the app's *current accessibility* for this
@@ -24,7 +24,9 @@
 //! an installed plugin that drives that app. Those are distinct facts and are
 //! rendered as such; a plugin being installed does not make the app
 //! accessible, and only app accessibility or an actual mounted tool inventory
-//! proves usability. Every [`ConnectorHealth`] variant maps to an observed
+//! proves usability. For an email send, a mounted MCP route must expose a
+//! Gmail-scoped send tool; read/search tools alone are not send capability.
+//! Every [`ConnectorHealth`] variant maps to an observed
 //! field value, a schema-documented default, or an explicit unknown — never a
 //! guess.
 
@@ -498,17 +500,17 @@ pub fn connector_overview(
 pub enum GmailRoute {
     /// The Gmail app is accessible for this account (`isAccessible == true`).
     App { app_id: String },
-    /// Gmail tools are actually mounted in the MCP inventory right now.
+    /// Gmail send tools are actually mounted in the MCP inventory right now.
     McpTools { tool_count: usize },
 }
 
 /// What `/email` can truthfully claim about Gmail before dispatching a turn.
 ///
 /// Only [`GmailReadiness::Ready`] asserts usability, and it requires an
-/// observed proof: app accessibility or a live Gmail tool inventory. A plugin
+/// observed proof: app accessibility or a live Gmail send-tool inventory. A plugin
 /// being installed and enabled is reported, but never treated as that proof —
 /// live wire captures showed the plugin state can exist while the app is not
-/// accessible and no Gmail tools are mounted.
+/// accessible and no Gmail send tools are mounted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GmailReadiness {
     /// Usability proven by an observed route.
@@ -534,17 +536,29 @@ fn is_gmail(name: &str) -> bool {
     name.eq_ignore_ascii_case("gmail")
 }
 
-fn has_gmail_tool(servers: &[McpRecord]) -> usize {
+fn app_is_gmail(app: &AppRecord) -> bool {
+    is_gmail(&app.name)
+        || is_gmail(&app.id)
+        || app.plugin_display_names.iter().any(|name| is_gmail(name))
+}
+
+fn gmail_send_tool_count(servers: &[McpRecord]) -> usize {
     servers
         .iter()
-        .flat_map(|server| server.tool_names.iter())
-        .filter(|tool| tool.to_ascii_lowercase().contains("gmail"))
+        .flat_map(|server| {
+            let server_is_gmail = server.name.to_ascii_lowercase().contains("gmail");
+            server.tool_names.iter().filter(move |tool| {
+                let tool = tool.to_ascii_lowercase();
+                let gmail_scoped = server_is_gmail || tool.contains("gmail");
+                gmail_scoped && tool.contains("send")
+            })
+        })
         .count()
 }
 
 /// Derives Gmail readiness from all three observed sources.
 ///
-/// Precedence: proven app accessibility, then proven tool inventory, then the
+/// Precedence: proven app accessibility, then proven send-tool inventory, then the
 /// unproven-but-reportable plugin facts, then the installable directory
 /// entry.
 #[must_use]
@@ -553,7 +567,7 @@ pub fn gmail_readiness(
     apps: &[AppRecord],
     servers: &[McpRecord],
 ) -> GmailReadiness {
-    let app = apps.iter().find(|app| is_gmail(&app.name));
+    let app = apps.iter().find(|app| app_is_gmail(app));
     if let Some(app) = app
         && app_health(app) == ConnectorHealth::Accessible
     {
@@ -563,7 +577,7 @@ pub fn gmail_readiness(
             },
         };
     }
-    let gmail_tools = has_gmail_tool(servers);
+    let gmail_tools = gmail_send_tool_count(servers);
     if gmail_tools > 0 {
         return GmailReadiness::Ready {
             route: GmailRoute::McpTools {
@@ -603,9 +617,8 @@ pub fn gmail_readiness(
 /// model's classification, never that a particular product (e.g. Gmail) is
 /// installed on the machine. Every RPC used here only reads state
 /// (`app/list`, `plugin/installed`, `mcpServerStatus/list`); nothing is
-/// installed, mutated, or logged in. All printed output passes through the
-/// crate's central secret redaction plus a home-path scrub so tokens,
-/// usernames, and personal paths never reach the console.
+/// installed, mutated, or logged in. The harness never prints connector,
+/// plugin, server, tool, account, or path values from the local machine.
 #[cfg(test)]
 mod live_tests {
     use serde_json::Value;
@@ -614,25 +627,6 @@ mod live_tests {
     use crate::codex::{
         AppListParams, CodexClient, McpServerStatusListParams, PluginInstalledParams,
     };
-
-    /// Central secret redaction (`security::redact_secrets`) plus removal of
-    /// the local home directory and username. Kept test-only so the crate has
-    /// exactly one production redaction implementation.
-    fn sanitize(text: &str) -> String {
-        let redacted = crate::security::redact_secrets(&Value::String(text.to_owned()));
-        let mut out = redacted.as_str().unwrap_or_default().to_owned();
-        for var in ["USERPROFILE", "HOME", "USERNAME", "USER"] {
-            if let Some(value) = std::env::var_os(var) {
-                let value = value.to_string_lossy();
-                if value.len() >= 4 {
-                    out = out.replace(value.as_ref(), "<HOME>");
-                    out = out.replace(&value.replace('\\', "/"), "<HOME>");
-                    out = out.replace(&value.replace('\\', "\\\\"), "<HOME>");
-                }
-            }
-        }
-        out
-    }
 
     async fn fetch_all_apps(client: &CodexClient) -> Vec<AppRecord> {
         let mut records = Vec::new();
@@ -704,18 +698,16 @@ mod live_tests {
         let plugins = fetch_installed_plugins(&client).await;
         let servers = fetch_mcp_servers(&client).await;
 
-        for plugin in &plugins {
+        for (index, plugin) in plugins.iter().enumerate() {
             assert!(
                 plugin.installed.is_some() && plugin.enabled.is_some(),
-                "plugin `{}` omitted schema-required installed/enabled",
-                sanitize(&plugin.id)
+                "plugin row {index} omitted schema-required installed/enabled"
             );
         }
-        for server in &servers {
+        for (index, server) in servers.iter().enumerate() {
             assert!(
                 server.auth_status.is_some(),
-                "MCP server `{}` omitted schema-required authStatus",
-                sanitize(&server.name)
+                "MCP server row {index} omitted schema-required authStatus"
             );
         }
         client.close().await;
@@ -734,23 +726,15 @@ mod live_tests {
             !rows.is_empty(),
             "an installed Codex should expose at least one connector row"
         );
-        for row in &rows {
+        for (index, row) in rows.iter().enumerate() {
             assert_ne!(
                 row.health,
                 ConnectorHealth::Unknown,
-                "live data produced an unclassifiable row: {}",
-                sanitize(&format!("{row:?}"))
+                "live data produced an unclassifiable row at index {index}"
             );
             if let Some(url) = &row.connect_url {
                 assert!(url.starts_with("https://"), "connect URL must be https");
             }
-            eprintln!(
-                "{} {} — {} · {}",
-                row.health.emoji(),
-                sanitize(&row.name),
-                row.health.label(),
-                sanitize(&row.detail)
-            );
         }
         client.close().await;
     }
@@ -781,8 +765,7 @@ mod live_tests {
             assert_eq!(row.health, app_health(app), "health must stay the app's");
             assert!(
                 row.detail.contains(&format!("plugin `{}`", plugin.name)),
-                "plugin fact missing from row: {}",
-                sanitize(&row.detail)
+                "plugin fact missing from matched overview row"
             );
         }
 
@@ -796,8 +779,8 @@ mod live_tests {
         });
         let gmail_app_accessible = apps
             .iter()
-            .any(|app| is_gmail(&app.name) && app_health(app) == ConnectorHealth::Accessible);
-        let gmail_tools_mounted = has_gmail_tool(&servers) > 0;
+            .any(|app| app_is_gmail(app) && app_health(app) == ConnectorHealth::Accessible);
+        let gmail_tools_mounted = gmail_send_tool_count(&servers) > 0;
         if let GmailReadiness::Ready { .. } = &readiness {
             assert!(
                 gmail_app_accessible || gmail_tools_mounted,
@@ -806,11 +789,9 @@ mod live_tests {
         } else if gmail_plugin_installed {
             assert!(
                 matches!(readiness, GmailReadiness::PluginUnverified { .. }),
-                "installed gmail plugin must surface as PluginUnverified, got {}",
-                sanitize(&format!("{readiness:?}"))
+                "installed Gmail plugin must surface as PluginUnverified"
             );
         }
-        eprintln!("gmail readiness: {}", sanitize(&format!("{readiness:?}")));
         client.close().await;
     }
 }
@@ -820,23 +801,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Shape captured live from Codex 0.144.1 on 2026-07-19: the Gmail
-    /// directory entry while only the plugin (not the app) is installed.
+    /// Genericized Gmail directory fixture matching the installed schema.
     fn live_gmail_app() -> Value {
         json!({
-            "id": "connector_2128aebfecb84f64a069897515042a44",
+            "id": "connector_gmail_fixture",
             "name": "Gmail",
             "description": "Review your Gmail conversations…",
             "distributionChannel": "DEFAULT_OAI_CATALOG",
             "labels": {"consequential": "true", "retrievable": "true", "sync": "true"},
-            "installUrl": "https://chatgpt.com/apps/gmail/connector_2128aebfecb84f64a069897515042a44",
+            "installUrl": "https://chatgpt.com/apps/gmail/connector_fixture",
             "isAccessible": false,
             "isEnabled": true,
             "pluginDisplayNames": []
         })
     }
 
-    /// Shape captured live: the installed Gmail plugin summary.
+    /// Genericized installed Gmail plugin fixture matching the schema.
     fn live_gmail_plugin() -> Value {
         json!({
             "id": "gmail@openai-curated",
@@ -982,7 +962,7 @@ mod tests {
         // path to make it accessible.
         assert_eq!(
             row.connect_url.as_deref(),
-            Some("https://chatgpt.com/apps/gmail/connector_2128aebfecb84f64a069897515042a44")
+            Some("https://chatgpt.com/apps/gmail/connector_fixture")
         );
     }
 
@@ -1070,10 +1050,7 @@ mod tests {
             gmail_readiness(&plugins, &apps, &servers),
             GmailReadiness::PluginUnverified {
                 plugin_name: "gmail".to_owned(),
-                connect_url: Some(
-                    "https://chatgpt.com/apps/gmail/connector_2128aebfecb84f64a069897515042a44"
-                        .to_owned()
-                )
+                connect_url: Some("https://chatgpt.com/apps/gmail/connector_fixture".to_owned())
             }
         );
     }
@@ -1087,14 +1064,14 @@ mod tests {
             gmail_readiness(&[], &apps, &[]),
             GmailReadiness::Ready {
                 route: GmailRoute::App {
-                    app_id: "connector_2128aebfecb84f64a069897515042a44".to_owned()
+                    app_id: "connector_gmail_fixture".to_owned()
                 }
             }
         );
     }
 
     #[test]
-    fn gmail_readiness_accepts_mounted_gmail_tools_as_proof() {
+    fn gmail_readiness_does_not_treat_read_only_gmail_tools_as_send_proof() {
         let plugins = [PluginRecord::from_value(&live_gmail_plugin(), "openai-curated").unwrap()];
         let servers = [McpRecord::from_value(&json!({
             "name": "codex_apps", "authStatus": "bearerToken",
@@ -1103,8 +1080,24 @@ mod tests {
         .unwrap()];
         assert_eq!(
             gmail_readiness(&plugins, &[], &servers),
+            GmailReadiness::PluginUnverified {
+                plugin_name: "gmail".to_owned(),
+                connect_url: None
+            }
+        );
+    }
+
+    #[test]
+    fn gmail_readiness_accepts_mounted_send_tool_as_proof() {
+        let servers = [McpRecord::from_value(&json!({
+            "name": "codex_apps", "authStatus": "bearerToken",
+            "tools": {"gmail.send_email": {}, "gmail.search_email_ids": {}}
+        }))
+        .unwrap()];
+        assert_eq!(
+            gmail_readiness(&[], &[], &servers),
             GmailReadiness::Ready {
-                route: GmailRoute::McpTools { tool_count: 2 }
+                route: GmailRoute::McpTools { tool_count: 1 }
             }
         );
     }
@@ -1115,10 +1108,7 @@ mod tests {
         assert_eq!(
             gmail_readiness(&[], &apps, &[]),
             GmailReadiness::AppInstallable {
-                connect_url: Some(
-                    "https://chatgpt.com/apps/gmail/connector_2128aebfecb84f64a069897515042a44"
-                        .to_owned()
-                )
+                connect_url: Some("https://chatgpt.com/apps/gmail/connector_fixture".to_owned())
             }
         );
 
@@ -1140,7 +1130,7 @@ mod tests {
             gmail_readiness(std::slice::from_ref(&blocked), &accessible, &[]),
             GmailReadiness::Ready {
                 route: GmailRoute::App {
-                    app_id: "connector_2128aebfecb84f64a069897515042a44".to_owned()
+                    app_id: "connector_gmail_fixture".to_owned()
                 }
             }
         );

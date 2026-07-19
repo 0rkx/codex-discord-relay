@@ -88,7 +88,9 @@ and exists for developer recovery—not routine use.
 
 - Buttons handle task creation, opening, interruption, state transitions, confirmations, and GOD
   revocation.
-- Select menus handle task lists, action families/methods, models, modes, skills, apps, plugins, and files.
+- Select menus handle task lists, action families/methods, models, modes, and plugin detail choices.
+- Skills, apps, and files currently use bounded paginated catalog cards; they are not falsely
+  described as native selects until typed selection is wired into turn input.
 - Modals collect new-task data, action parameters, approval input, elicitation input, and the GOD
   password without posting it to channel history.
 - Autocomplete is backed by the installed app-server schema for methods and other live catalogs.

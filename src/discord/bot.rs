@@ -44,9 +44,9 @@ use crate::{
         FuzzyFileSearchParams, McpServerStatusListParams, ModelListParams, Notification,
         PluginInstalledParams, PluginListParams, PluginLocatorParams, ReviewStartParams,
         ReviewTarget, RpcErrorObject, ServerRequest, SkillsListParams, ThreadForkParams,
-        ThreadGoalSetParams, ThreadListParams, ThreadSearchParams, ThreadSettingsUpdateParams,
-        ThreadStartParams, ThreadTurnsListParams, TurnInterruptParams, TurnStartParams,
-        TurnSteerParams, UserInput, coverage::CoverageReport,
+        ThreadGoalSetParams, ThreadListParams, ThreadResumeParams, ThreadSearchParams,
+        ThreadSettingsUpdateParams, ThreadStartParams, ThreadTurnsListParams, TurnInterruptParams,
+        TurnStartParams, TurnSteerParams, UserInput, coverage::CoverageReport,
     },
     config::{self, Config},
     discord::{
@@ -74,9 +74,9 @@ use crate::{
     state::StateStore,
 };
 
-const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-sol";
-const RELAY_DEFAULT_REASONING_EFFORT: &str = "medium";
-const RELAY_DEVELOPER_INSTRUCTIONS: &str = "Work as the installed Codex agent, not as a chat-only assistant. Inspect available apps, plugins, MCP servers, and tools before claiming a capability is unavailable. For current or public facts, search the web and open an authoritative source before concluding. Continue through relevant tool calls and verification until the requested outcome is complete or a genuine user/auth/external blocker remains. Never fabricate tool use, connector success, citations, or external actions.";
+pub(crate) const RELAY_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub(crate) const RELAY_DEFAULT_REASONING_EFFORT: &str = "medium";
+pub(crate) const RELAY_DEVELOPER_INSTRUCTIONS: &str = "Work as the installed Codex agent, not as a chat-only assistant. Inspect available apps, plugins, MCP servers, and tools before claiming a capability is unavailable. For current or public facts, search the web and open an authoritative source before concluding. Continue through relevant tool calls and verification until the requested outcome is complete or a genuine user/auth/external blocker remains. Never fabricate tool use, connector success, citations, or external actions.";
 
 #[derive(Default)]
 struct StreamBuffer {
@@ -1669,7 +1669,7 @@ impl Handler {
         let mut task = self.task_for_channel(modal.channel_id).await?;
         // Readiness comes from all three observed sources; an installed
         // plugin alone never proves Gmail works — only app accessibility or
-        // an actually mounted Gmail tool does. The app walk uses cached data
+        // an actually mounted Gmail send tool does. The app walk uses cached data
         // (a fresh fetch takes 60–90s); plugin and MCP state degrade
         // independently, which can only make the verdict more conservative.
         let plugins = match self
@@ -1701,11 +1701,11 @@ impl Handler {
             .filter_map(AppRecord::from_value)
             .collect::<Vec<_>>();
         let readiness = gmail_readiness(&plugins, &apps, &servers);
-        let gmail_mention = match &readiness {
+        let gmail_app_id = match &readiness {
             GmailReadiness::Ready {
                 route: GmailRoute::App { app_id },
-            } => format!("[$Gmail](app://{app_id})\n"),
-            _ => String::new(),
+            } => Some(app_id.clone()),
+            _ => None,
         };
         let route_instruction = match &readiness {
             GmailReadiness::Ready {
@@ -1722,8 +1722,9 @@ impl Handler {
             format!("\nCc: {cc}")
         };
         let prompt = format!(
-            "{gmail_mention}{route_instruction} If Gmail needs installation, authorization, or confirmation, request it through the connector flow and continue after approval. Do not claim success without a successful connector result.\nTo: {to}{cc_line}\nSubject: {subject}\n\n{body}"
+            "{route_instruction} If Gmail needs installation, authorization, or confirmation, request it through the connector flow and continue after approval. Do not claim success without a successful connector result.\nTo: {to}{cc_line}\nSubject: {subject}\n\n{body}"
         );
+        let input = email_turn_input(gmail_app_id.as_deref(), prompt);
         let security_context = self
             .security_context(http, modal.user.id.get(), modal.guild_id, modal.channel_id)
             .await;
@@ -1732,7 +1733,7 @@ impl Handler {
             &security_context,
             modal.channel_id,
             &mut task,
-            vec![UserInput::text(prompt)],
+            input,
             "GOD email turn dispatch",
         )
         .await?;
@@ -2589,6 +2590,10 @@ impl Handler {
             self.require_installed_method("thread/unarchive")?;
             self.state.codex.thread_unarchive(thread_id).await?;
         }
+        // `thread/read` is inspection, not runtime activation. A fresh
+        // app-server process can read a stored task and still reject its next
+        // turn as "thread not found" unless the task is explicitly resumed.
+        resume_task_for_relay(&self.state.codex, thread_id).await?;
         if let Some(task) = self.state.store.task(thread_id).await?
             && let Some(channel_id) = task.channel_id
         {
@@ -9084,13 +9089,26 @@ fn boolean_command_option(command: &CommandInteraction, name: &str) -> Option<bo
     })
 }
 
+async fn resume_task_for_relay(client: &CodexClient, thread_id: &str) -> Result<Value> {
+    Ok(client
+        .thread_resume(ThreadResumeParams {
+            thread_id: thread_id.to_owned(),
+            cwd: None,
+            model: None,
+            approval_policy: Some(CodexExecutionPolicy::NORMAL.approval_policy.to_owned()),
+            sandbox: Some(CodexExecutionPolicy::NORMAL.thread_sandbox()),
+            extra: BTreeMap::new(),
+        })
+        .await?)
+}
+
 /// After a Relay restart, a stored task thread may no longer be loaded in the
 /// app-server; `app/list` then fails with RPC -32600 "thread not found: …".
 fn is_thread_not_found(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<ClientError>(),
         Some(ClientError::Rpc { code: -32600, message, .. })
-            if message.to_ascii_lowercase().contains("thread not found")
+            if message.to_ascii_lowercase().starts_with("thread not found:")
     )
 }
 
@@ -9458,7 +9476,7 @@ fn plugin_browser_view(
 /// Acknowledgement text plus optional install links for `/email`, phrased
 /// from observed Gmail state only. Usability is claimed solely for
 /// [`GmailReadiness::Ready`], which requires app accessibility or a mounted
-/// Gmail tool — never the plugin install alone.
+/// Gmail send tool — never the plugin install alone.
 fn email_ack_for_readiness(readiness: &GmailReadiness) -> (String, Vec<(String, String)>) {
     match readiness {
         GmailReadiness::Ready { route } => (
@@ -9467,7 +9485,7 @@ fn email_ack_for_readiness(readiness: &GmailReadiness) -> (String, Vec<(String, 
                     "Email request sent to Codex. The Gmail app is accessible; approval may still be required.".to_owned()
                 }
                 GmailRoute::McpTools { tool_count } => format!(
-                    "Email request sent to Codex. {tool_count} Gmail tool{} mounted; approval may still be required.",
+                    "Email request sent to Codex. {tool_count} Gmail send tool{} mounted; approval may still be required.",
                     if *tool_count == 1 { " is" } else { "s are" }
                 ),
             },
@@ -9509,6 +9527,18 @@ fn email_ack_for_readiness(readiness: &GmailReadiness) -> (String, Vec<(String, 
             Vec::new(),
         ),
     }
+}
+
+fn email_turn_input(gmail_app_id: Option<&str>, prompt: String) -> Vec<UserInput> {
+    let mut input = Vec::with_capacity(2);
+    if let Some(app_id) = gmail_app_id {
+        input.push(UserInput::Mention {
+            name: "Gmail".to_owned(),
+            path: format!("app://{app_id}"),
+        });
+    }
+    input.push(UserInput::text(prompt));
+    input
 }
 
 fn plugin_auth_links(value: &Value) -> Vec<(String, String)> {
@@ -10435,8 +10465,8 @@ mod capability_list_tests {
 
     use super::{
         ConnectorHealth, GmailReadiness, GmailRoute, collect_skills, email_ack_for_readiness,
-        mcp_catalog_rows, model_reasoning_efforts, page_window, plugin_auth_links,
-        plugin_available_mutation, plugin_catalog_rows, plugin_mutation_params,
+        email_turn_input, mcp_catalog_rows, model_reasoning_efforts, page_window,
+        plugin_auth_links, plugin_available_mutation, plugin_catalog_rows, plugin_mutation_params,
     };
 
     #[test]
@@ -10623,7 +10653,7 @@ mod capability_list_tests {
         let (ack, _) = email_ack_for_readiness(&GmailReadiness::Ready {
             route: GmailRoute::McpTools { tool_count: 2 },
         });
-        assert!(ack.contains("2 Gmail tools are mounted"), "{ack}");
+        assert!(ack.contains("2 Gmail send tools are mounted"), "{ack}");
 
         // The plugin install alone is reported as an unverified fact, with
         // the install link offered — never as working Gmail.
@@ -10655,6 +10685,135 @@ mod capability_list_tests {
 
         let (ack, _) = email_ack_for_readiness(&GmailReadiness::NotConfigured);
         assert!(ack.contains("No Gmail plugin or app was observed"), "{ack}");
+    }
+
+    #[test]
+    fn email_turn_uses_typed_app_mention_when_gmail_is_accessible() {
+        let input = email_turn_input(Some("connector_x"), "send it".to_owned());
+        assert_eq!(
+            serde_json::to_value(&input).unwrap(),
+            json!([
+                {"type":"mention","name":"Gmail","path":"app://connector_x"},
+                {"type":"text","text":"send it"}
+            ])
+        );
+
+        let without_app = email_turn_input(None, "send it".to_owned());
+        assert_eq!(without_app.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&without_app).unwrap()[0]["type"],
+            "text"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_reopen_tests {
+    use std::{collections::BTreeMap, time::Duration};
+
+    use serde_json::json;
+    use tokio::time::timeout;
+
+    use super::{
+        CodexClient, CodexExecutionPolicy, HostBroker, RELAY_DEFAULT_MODEL,
+        RELAY_DEFAULT_REASONING_EFFORT, RELAY_DEVELOPER_INSTRUCTIONS, ThreadSettingsUpdateParams,
+        ThreadStartParams, TurnInterruptParams, UserInput, resume_task_for_relay,
+    };
+
+    async fn marker_turn(client: &CodexClient, thread_id: &str, cwd: &str, marker: &str) {
+        let mut notifications = client.subscribe_notifications();
+        let turn = client
+            .turn_start(CodexExecutionPolicy::NORMAL.turn_start_params(
+                thread_id.to_owned(),
+                vec![UserInput::text(format!("Reply only {marker}."))],
+                Some(cwd.to_owned()),
+                Some(RELAY_DEFAULT_MODEL.to_owned()),
+            ))
+            .await
+            .unwrap();
+        let turn_id = turn["turn"]["id"].as_str().unwrap().to_owned();
+        let observed = timeout(Duration::from_secs(240), async {
+            let mut saw_marker = false;
+            loop {
+                let event = notifications.recv().await.unwrap();
+                if event.params["threadId"] != thread_id {
+                    continue;
+                }
+                if event.method == "item/completed"
+                    && event.params["turnId"] == turn_id
+                    && event.params["item"]["type"] == "agentMessage"
+                {
+                    saw_marker |= event.params["item"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(marker));
+                }
+                if event.method == "turn/completed" && event.params["turn"]["id"] == turn_id {
+                    break saw_marker;
+                }
+            }
+        })
+        .await;
+        if observed.is_err() {
+            let _ = client
+                .turn_interrupt(TurnInterruptParams {
+                    thread_id: thread_id.to_owned(),
+                    turn_id,
+                })
+                .await;
+        }
+        assert!(
+            observed.expect("marker turn timed out"),
+            "turn completed without marker {marker}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the locally installed Codex app-server and model access"]
+    async fn live_reopened_task_resumes_before_second_turn() {
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let first = CodexClient::discover().unwrap();
+        let created = first
+            .thread_start(ThreadStartParams {
+                cwd: Some(cwd.clone()),
+                model: Some(RELAY_DEFAULT_MODEL.to_owned()),
+                approval_policy: Some(CodexExecutionPolicy::NORMAL.approval_policy.to_owned()),
+                sandbox: Some(CodexExecutionPolicy::NORMAL.thread_sandbox()),
+                personality: None,
+                developer_instructions: Some(RELAY_DEVELOPER_INSTRUCTIONS.to_owned()),
+                runtime_workspace_roots: Some(vec![cwd.clone()]),
+                dynamic_tools: Some(HostBroker::dynamic_tool_specs()),
+                extra: BTreeMap::from([("config".to_owned(), json!({"web_search":"live"}))]),
+            })
+            .await
+            .unwrap();
+        let thread_id = created["thread"]["id"].as_str().unwrap().to_owned();
+        first
+            .thread_settings_update(ThreadSettingsUpdateParams {
+                thread_id: thread_id.clone(),
+                effort: Some(RELAY_DEFAULT_REASONING_EFFORT.to_owned()),
+                collaboration_mode: None,
+            })
+            .await
+            .unwrap();
+        marker_turn(&first, &thread_id, &cwd, "FIRST_REOPEN_OK").await;
+        first.close().await;
+
+        let second = CodexClient::discover().unwrap();
+        let resumed = resume_task_for_relay(&second, &thread_id).await.unwrap();
+        assert_eq!(resumed["thread"]["id"], thread_id);
+        marker_turn(&second, &thread_id, &cwd, "SECOND_REOPEN_OK").await;
+        let read = second
+            .request_value(
+                "thread/read",
+                json!({"threadId":thread_id,"includeTurns":true}),
+            )
+            .await
+            .unwrap();
+        let retained_first_turn = read.to_string().contains("FIRST_REOPEN_OK");
+        let delete = second.thread_delete(thread_id).await;
+        second.close().await;
+        delete.expect("live reopen test could not delete its task");
+        assert!(retained_first_turn, "resume lost the first turn history");
     }
 }
 

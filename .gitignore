@@ -6,3 +6,4 @@
 *.sqlite3-shm
 *.sqlite3-wal
 config.local.toml
+/.claude/
