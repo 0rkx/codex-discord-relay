@@ -381,6 +381,7 @@ impl ProjectionCore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_patch(
         &mut self,
         thread_id: &str,
@@ -594,7 +595,7 @@ fn decode_chunk(chunk: OutputChunk<'_>) -> Result<String, ProjectionError> {
         }
         ChunkEncoding::Base64 => {
             let encoded_len = chunk.data.len();
-            if encoded_len % 4 != 0 || !chunk.data.is_ascii() {
+            if !encoded_len.is_multiple_of(4) || !chunk.data.is_ascii() {
                 return Err(ProjectionError::InvalidBase64);
             }
             let predicted = encoded_len

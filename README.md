@@ -31,9 +31,14 @@ Public documentation:
   it in Codex first so new turns are accepted again
 - Dedicated `/model`, `/review`, `/compact`, `/rollback`, `/rename`, `/skills`, `/apps`, `/plugins`,
   `/config`, `/account`, `/usage`, and `/capabilities` commands backed by typed Rust helpers
-- `/apps` reads the complete paginated catalog, accepts an optional name filter, and distinguishes
-  connected, not-connected, and disabled integrations from Codex's real accessibility fields
-- `/plugins` searches installed and marketplace catalogs, opens full capability details, and offers
+- `/apps` defaults to a merged connector-health view that joins app accessibility
+  (`isAccessible`, shown as installed / can-be-installed like the official TUI), installed
+  plugin state, and MCP auth status into one truthful roster — a product like Gmail whose
+  plugin is installed while the app is not accessible shows both facts, with https-only
+  "Install" buttons; results come from Codex's app cache (`refresh:true` re-fetches, ~60–90s)
+  and `/apps scope:directory` still browses the complete paginated catalog
+- `/plugins` searches installed and marketplace catalogs, opens full capability details (auth
+  timing, admin availability, and the ChatGPT apps a plugin drives), and offers
   confirmation-gated install/uninstall controls plus authentication links returned by Codex
 - Task productivity commands: `/goal` (objective/budget tracking), `/history` (recent turn
   digest), `/terminals` (list/terminate/clean background terminals), `/files` (fuzzy workspace
@@ -44,8 +49,10 @@ Public documentation:
 - Relay-created tasks register a native Rust `codex_app` HostBroker. Codex can list and read tasks
   asynchronously through real `dynamicTools` calls; calls are turn-bound, allowlisted, redacted,
   timeout-limited, and rendered in the activity embed
-- `/email` opens a native modal, attaches Gmail explicitly, and carries installation,
-  authorization, approval, and send results through the Codex connector flow
+- `/email` opens a native modal and verifies Gmail against observed state before dispatch:
+  usability is claimed only when the Gmail app is accessible or Gmail tools are actually
+  mounted; an installed plugin is acknowledged as an unverified fact, and the connector flow
+  carries installation, authorization, approval, and send results either way
 - Typed command/file/permission approvals plus question-specific user-input and MCP elicitation
   controls; cards honor Codex `availableDecisions`, copy policy amendments only from the server,
   bind replies to the originating app-server process, and expire after 15 minutes

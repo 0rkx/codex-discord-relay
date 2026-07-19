@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod bot;
 pub mod components;
+pub mod connectors;
 pub mod embeds;
 pub mod host_broker;
 pub mod notifications;

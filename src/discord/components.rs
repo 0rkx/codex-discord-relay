@@ -444,16 +444,32 @@ pub fn plugin_detail_buttons(
 pub fn plugin_auth_buttons(
     apps: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<CreateActionRow> {
-    let buttons = apps
+    link_button_rows("Authenticate", '🔐', apps)
+}
+
+/// Link buttons that open an app's chatgpt.com install page ("Can be
+/// installed" in official TUI wording).
+#[must_use]
+pub fn connector_link_buttons(
+    apps: impl IntoIterator<Item = (String, String)>,
+) -> Vec<CreateActionRow> {
+    link_button_rows("Install", '⬇', apps)
+}
+
+/// External setup/auth links are HTTPS-only; plain http is rejected.
+fn link_button_rows(
+    verb: &str,
+    emoji: char,
+    items: impl IntoIterator<Item = (String, String)>,
+) -> Vec<CreateActionRow> {
+    let buttons = items
         .into_iter()
-        .filter(|(_, url)| {
-            url.len() <= 2_048 && (url.starts_with("https://") || url.starts_with("http://"))
-        })
+        .filter(|(_, url)| url.len() <= 2_048 && url.starts_with("https://"))
         .take(20)
         .map(|(name, url)| {
             CreateButton::new_link(url)
-                .label(truncate(&format!("Authenticate {name}"), 80))
-                .emoji('🔐')
+                .label(truncate(&format!("{verb} {name}"), 80))
+                .emoji(emoji)
         })
         .collect::<Vec<_>>();
     buttons
@@ -768,5 +784,36 @@ mod tests {
         assert_eq!(auth.as_array().unwrap().len(), 1);
         assert_eq!(auth[0]["components"].as_array().unwrap().len(), 1);
         assert_eq!(auth[0]["components"][0]["url"], "https://example.test/auth");
+    }
+
+    #[test]
+    fn setup_link_buttons_reject_everything_but_https() {
+        let rows = serde_json::to_value(connector_link_buttons([
+            (
+                "Gmail".to_owned(),
+                "https://chatgpt.com/apps/gmail".to_owned(),
+            ),
+            ("Evil".to_owned(), "javascript:alert(1)".to_owned()),
+            (
+                "Plain".to_owned(),
+                "http://chatgpt.com/apps/plain".to_owned(),
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["components"].as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["components"][0]["label"], "Install Gmail");
+        assert_eq!(
+            rows[0]["components"][0]["url"],
+            "https://chatgpt.com/apps/gmail"
+        );
+
+        // The auth variant shares the same https-only filter.
+        let auth = serde_json::to_value(plugin_auth_buttons([(
+            "Plain".to_owned(),
+            "http://example.test/auth".to_owned(),
+        )]))
+        .unwrap();
+        assert!(auth.as_array().unwrap().is_empty());
     }
 }

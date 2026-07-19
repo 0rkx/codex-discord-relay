@@ -307,6 +307,7 @@ pub fn live_operations_card(summaries: &[String]) -> CreateEmbed {
 }
 
 /// Coalesced live transcript for one experimental Codex realtime session.
+#[allow(clippy::too_many_arguments)]
 pub fn realtime_card(
     transcript: &str,
     active: bool,

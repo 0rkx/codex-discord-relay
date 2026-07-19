@@ -39,7 +39,7 @@ use zeroize::Zeroizing;
 use crate::{
     codex::{
         AccountReadParams, AppListParams, BackgroundTerminalTerminateParams,
-        BackgroundTerminalsListParams, CapabilityCatalog, CodexClient, CodexCommand,
+        BackgroundTerminalsListParams, CapabilityCatalog, ClientError, CodexClient, CodexCommand,
         CollaborationModeSetting, CollaborationModeSettings, ConfigReadParams,
         FuzzyFileSearchParams, McpServerStatusListParams, ModelListParams, Notification,
         PluginInstalledParams, PluginListParams, PluginLocatorParams, ReviewStartParams,
@@ -51,7 +51,12 @@ use crate::{
     config::{self, Config},
     discord::{
         actions::{self, ActionAuthorization, ActionDraft, ActionSurface},
-        components, embeds,
+        components,
+        connectors::{
+            AppRecord, ConnectorHealth, GmailReadiness, GmailRoute, McpRecord, PluginRecord,
+            app_health, auth_policy_note, connector_overview, gmail_readiness, mcp_auth_label,
+        },
+        embeds,
         host_broker::HostBroker,
         notifications,
         projection::{CompletionState, OutputChunk, OutputStream, PatchState, ProjectionCore},
@@ -1662,24 +1667,62 @@ impl Handler {
         );
         defer_modal(http, modal).await?;
         let mut task = self.task_for_channel(modal.channel_id).await?;
-        let gmail_mention = collect_apps(&self.state.codex, Some(task.thread_id.clone()), true)
+        // Readiness comes from all three observed sources; an installed
+        // plugin alone never proves Gmail works — only app accessibility or
+        // an actually mounted Gmail tool does. The app walk uses cached data
+        // (a fresh fetch takes 60–90s); plugin and MCP state degrade
+        // independently, which can only make the verdict more conservative.
+        let plugins = match self
+            .state
+            .codex
+            .plugin_installed(PluginInstalledParams::default())
+            .await
+        {
+            Ok(result) => PluginRecord::from_marketplaces(&result),
+            Err(error) => {
+                warn!(%error, "plugin/installed unavailable for /email readiness");
+                Vec::new()
+            }
+        };
+        let servers =
+            match collect_mcp_servers(&self.state.codex, Some(task.thread_id.clone())).await {
+                Ok(servers) => servers
+                    .iter()
+                    .filter_map(McpRecord::from_value)
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    warn!(%error, "mcpServerStatus/list unavailable for /email readiness");
+                    Vec::new()
+                }
+            };
+        let apps = collect_apps(&self.state.codex, Some(task.thread_id.clone()), false)
             .await?
-            .into_iter()
-            .find(|app| {
-                app.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("gmail"))
-            })
-            .and_then(|app| app.get("id").and_then(Value::as_str).map(str::to_owned))
-            .map(|id| format!("[$Gmail](app://{id})\n"))
-            .unwrap_or_default();
+            .iter()
+            .filter_map(AppRecord::from_value)
+            .collect::<Vec<_>>();
+        let readiness = gmail_readiness(&plugins, &apps, &servers);
+        let gmail_mention = match &readiness {
+            GmailReadiness::Ready {
+                route: GmailRoute::App { app_id },
+            } => format!("[$Gmail](app://{app_id})\n"),
+            _ => String::new(),
+        };
+        let route_instruction = match &readiness {
+            GmailReadiness::Ready {
+                route: GmailRoute::McpTools { .. },
+            } => "Use the available Gmail tools to send this email.".to_owned(),
+            GmailReadiness::PluginUnverified { plugin_name, .. } => format!(
+                "The `{plugin_name}` plugin is installed, but Gmail access is unverified; use the Gmail connector to send this email."
+            ),
+            _ => "Use the Gmail connector to send this email.".to_owned(),
+        };
         let cc_line = if cc.is_empty() {
             String::new()
         } else {
             format!("\nCc: {cc}")
         };
         let prompt = format!(
-            "{gmail_mention}Use the Gmail connector to send this email. If Gmail needs installation, authorization, or confirmation, request it through the connector flow and continue after approval. Do not claim success without a successful connector result.\nTo: {to}{cc_line}\nSubject: {subject}\n\n{body}"
+            "{gmail_mention}{route_instruction} If Gmail needs installation, authorization, or confirmation, request it through the connector flow and continue after approval. Do not claim success without a successful connector result.\nTo: {to}{cc_line}\nSubject: {subject}\n\n{body}"
         );
         let security_context = self
             .security_context(http, modal.user.id.get(), modal.guild_id, modal.channel_id)
@@ -1693,12 +1736,13 @@ impl Handler {
             "GOD email turn dispatch",
         )
         .await?;
+        let (ack, connect_links) = email_ack_for_readiness(&readiness);
         modal
             .edit_response(
                 http,
-                EditInteractionResponse::new().content(
-                    "Email request sent to Codex. Approval or connector setup may be required.",
-                ),
+                EditInteractionResponse::new()
+                    .content(ack)
+                    .components(components::connector_link_buttons(connect_links)),
             )
             .await?;
         Ok(())
@@ -3374,68 +3418,168 @@ impl Handler {
     }
 
     async fn apps(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
+        let scope = string_command_option(command, "scope").unwrap_or("mine");
+        match scope {
+            "mine" => self.apps_overview(http, command).await,
+            "directory" => self.apps_directory(http, command).await,
+            other => anyhow::bail!("unknown apps scope `{other}`"),
+        }
+    }
+
+    /// Merged connector-health view: directory apps that carry a signal,
+    /// installed plugins, and MCP servers, each with wire-derived state.
+    async fn apps_overview(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
         defer_command(http, command).await?;
         let query = string_command_option(command, "query")
             .map(str::trim)
             .filter(|query| !query.is_empty())
             .map(str::to_ascii_lowercase);
         let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
+        // Cached by default: a fresh app/list fetch takes 60–90 seconds.
+        let refresh = boolean_command_option(command, "refresh").unwrap_or(false);
+        let task = self
+            .state
+            .store
+            .task_by_channel(command.channel_id.get())
+            .await?;
+        let thread_id = task.as_ref().map(|task| task.thread_id.clone());
+        let cwd = task.and_then(|task| task.cwd);
+
+        let apps = collect_apps(&self.state.codex, thread_id.clone(), refresh)
+            .await?
+            .iter()
+            .filter_map(AppRecord::from_value)
+            .collect::<Vec<_>>();
+        // Plugin and MCP state degrade independently: a failed source is
+        // reported as unavailable rather than silently rendered as empty.
+        let mut source_notes = Vec::new();
+        let plugins = match self
+            .state
+            .codex
+            .plugin_installed(PluginInstalledParams {
+                cwds: cwd.map(|cwd| vec![cwd]),
+                install_suggestion_plugin_names: None,
+            })
+            .await
+        {
+            Ok(result) => PluginRecord::from_marketplaces(&result),
+            Err(error) => {
+                warn!(%error, "plugin/installed unavailable for /apps overview");
+                source_notes.push("⚠ plugin state unavailable (plugin/installed failed)");
+                Vec::new()
+            }
+        };
+        let servers = match collect_mcp_servers(&self.state.codex, thread_id).await {
+            Ok(servers) => servers
+                .iter()
+                .filter_map(McpRecord::from_value)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                warn!(%error, "mcpServerStatus/list unavailable for /apps overview");
+                source_notes.push("⚠ MCP state unavailable (mcpServerStatus/list failed)");
+                Vec::new()
+            }
+        };
+
+        let mut rows = connector_overview(&apps, &plugins, &servers);
+        if let Some(query) = query.as_deref() {
+            rows.retain(|row| {
+                row.name.to_ascii_lowercase().contains(query)
+                    || row.detail.to_ascii_lowercase().contains(query)
+            });
+        }
+        let (start, end, page, pages) = page_window(rows.len(), requested_page, 15);
+        let mut lines = String::new();
+        for row in &rows[start..end] {
+            lines.push_str(&format!(
+                "{} **{}** — {}\n   {}\n",
+                row.health.emoji(),
+                row.name.chars().take(100).collect::<String>(),
+                row.health.label(),
+                row.detail.chars().take(180).collect::<String>()
+            ));
+        }
+        if lines.is_empty() {
+            lines.push_str(
+                "No connectors with signal. Try `/apps scope:directory` to browse the catalog.",
+            );
+        }
+        lines.push_str(&format!(
+            "\nPage {page}/{pages} · {} connectors · {} · `/apps scope:directory` browses the full catalog",
+            rows.len(),
+            if refresh {
+                "freshly fetched"
+            } else {
+                "cached app data (`refresh:true` re-fetches, ~60–90s)"
+            }
+        ));
+        for note in source_notes {
+            lines.push('\n');
+            lines.push_str(note);
+        }
+        let connect_links = rows[start..end]
+            .iter()
+            .filter_map(|row| row.connect_url.clone().map(|url| (row.name.clone(), url)))
+            .take(10)
+            .collect::<Vec<_>>();
+        command
+            .edit_response(
+                http,
+                EditInteractionResponse::new()
+                    .embed(embeds::info_card("Codex connectors", &lines))
+                    .components(components::connector_link_buttons(connect_links)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Raw `app/list` directory browse (thousands of entries, paginated).
+    async fn apps_directory(&self, http: &Http, command: &CommandInteraction) -> Result<()> {
+        defer_command(http, command).await?;
+        let query = string_command_option(command, "query")
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_ascii_lowercase);
+        let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
+        // Cached by default: a fresh app/list fetch takes 60–90 seconds.
+        let refresh = boolean_command_option(command, "refresh").unwrap_or(false);
         let thread_id = self
             .state
             .store
             .task_by_channel(command.channel_id.get())
             .await?
             .map(|task| task.thread_id);
-        let mut apps = collect_apps(&self.state.codex, thread_id, true).await?;
+        let mut apps = collect_apps(&self.state.codex, thread_id, refresh)
+            .await?
+            .iter()
+            .filter_map(AppRecord::from_value)
+            .collect::<Vec<_>>();
         if let Some(query) = query.as_deref() {
             apps.retain(|app| {
-                app.get("name")
-                    .or_else(|| app.get("id"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| value.to_ascii_lowercase().contains(query))
+                app.name.to_ascii_lowercase().contains(query)
+                    || app.id.to_ascii_lowercase().contains(query)
             });
         }
+        // Directory order mirrors the TUI: installed (accessible) apps
+        // first, then installable, then disabled.
         apps.sort_by_key(|app| {
-            let accessible = app
-                .get("isAccessible")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let enabled = app
-                .get("isEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let name = app
-                .get("name")
-                .or_else(|| app.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            (!accessible, !enabled, name)
+            let rank = match app_health(app) {
+                ConnectorHealth::Accessible => 0_u8,
+                ConnectorHealth::Disabled => 2,
+                _ => 1,
+            };
+            (rank, app.name.to_ascii_lowercase())
         });
         let (start, end, page, pages) = page_window(apps.len(), requested_page, 25);
         let mut lines = String::new();
         for app in &apps[start..end] {
-            let name = app
-                .get("name")
-                .or_else(|| app.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unnamed");
-            let enabled = app
-                .get("isEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let accessible = app
-                .get("isAccessible")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let status = if !enabled {
-                "disabled"
-            } else if accessible {
-                "connected"
-            } else {
-                "not connected"
-            };
-            lines.push_str(&format!("**{name}** · {status}\n"));
+            let health = app_health(app);
+            lines.push_str(&format!(
+                "{} **{}** · {}\n",
+                health.emoji(),
+                app.name.chars().take(120).collect::<String>(),
+                health.label()
+            ));
         }
         if lines.is_empty() {
             lines.push_str("No apps/connectors available.");
@@ -3444,7 +3588,8 @@ impl Handler {
         command
             .edit_response(
                 http,
-                EditInteractionResponse::new().embed(embeds::info_card("Codex apps", &lines)),
+                EditInteractionResponse::new()
+                    .embed(embeds::info_card("Codex app directory", &lines)),
             )
             .await?;
         Ok(())
@@ -3581,18 +3726,40 @@ impl Handler {
             .await?;
         let detail = result.get("plugin").unwrap_or(&result);
         let summary = detail.get("summary").unwrap_or(detail);
-        let auth = summary
-            .get("authPolicy")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown auth policy");
+        let auth_policy = summary.get("authPolicy").and_then(Value::as_str);
+        let auth = auth_policy_note(auth_policy)
+            .map(str::to_owned)
+            .or_else(|| auth_policy.map(str::to_owned))
+            .unwrap_or_else(|| "unknown auth policy".to_owned());
         let install_policy = summary
             .get("installPolicy")
             .and_then(Value::as_str)
             .unwrap_or("unknown install policy");
+        let availability = summary
+            .get("availability")
+            .and_then(Value::as_str)
+            .filter(|availability| *availability != "AVAILABLE")
+            .map(|availability| format!(" · {availability}"))
+            .unwrap_or_default();
         let source = summary
             .pointer("/source/type")
             .and_then(Value::as_str)
             .unwrap_or("unknown source");
+        // `plugin/read` names the ChatGPT apps this plugin drives (for the
+        // Gmail plugin that is the Gmail connector entry).
+        let backing_apps = detail
+            .get("apps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|app| {
+                app.get("name")
+                    .or_else(|| app.get("id"))
+                    .and_then(Value::as_str)
+            })
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(", ");
         let counts = [
             ("apps", detail.get("apps")),
             ("skills", detail.get("skills")),
@@ -3614,15 +3781,19 @@ impl Handler {
             .and_then(Value::as_str)
             .unwrap_or(&row.description)
             .replace('\n', " ");
-        let lines = format!(
-            "{}\n\n**Marketplace:** {}\n**Status:** {} · {}\n**Source:** {}\n**Capabilities:** {}",
+        let mut lines = format!(
+            "{}\n\n**Marketplace:** {}\n**Status:** {} · {}{}\n**Source:** {}\n**Capabilities:** {}",
             description.chars().take(900).collect::<String>(),
             row.marketplace,
             auth,
             install_policy,
+            availability,
             source,
             counts
         );
+        if !backing_apps.is_empty() {
+            lines.push_str(&format!("\n**Drives apps:** {backing_apps}"));
+        }
         component
             .edit_response(
                 http,
@@ -5010,7 +5181,13 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                     .required(false),
             ),
         CommandBuilder::new("apps")
-            .description("Search Codex apps and connectors")
+            .description("Show connector health or browse the Codex app directory")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "scope", "What to show")
+                    .add_string_choice("My connectors (health)", "mine")
+                    .add_string_choice("Full app directory", "directory")
+                    .required(false),
+            )
             .add_option(
                 CreateCommandOption::new(
                     CommandOptionType::String,
@@ -5024,6 +5201,14 @@ pub async fn register_commands(http: &Http, guild_id: u64) -> Result<()> {
                     .min_int_value(1)
                     .max_int_value(100)
                     .required(false),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Boolean,
+                    "refresh",
+                    "Bypass the app cache and re-fetch (slow, ~60-90s)",
+                )
+                .required(false),
             ),
         CommandBuilder::new("plugins")
             .description("Browse installed plugins or every configured marketplace")
@@ -8899,7 +9084,31 @@ fn boolean_command_option(command: &CommandInteraction, name: &str) -> Option<bo
     })
 }
 
+/// After a Relay restart, a stored task thread may no longer be loaded in the
+/// app-server; `app/list` then fails with RPC -32600 "thread not found: …".
+fn is_thread_not_found(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<ClientError>(),
+        Some(ClientError::Rpc { code: -32600, message, .. })
+            if message.to_ascii_lowercase().contains("thread not found")
+    )
+}
+
 async fn collect_apps(
+    client: &CodexClient,
+    thread_id: Option<String>,
+    force_refetch: bool,
+) -> Result<Vec<Value>> {
+    match collect_apps_paged(client, thread_id.clone(), force_refetch).await {
+        Err(error) if thread_id.is_some() && is_thread_not_found(&error) => {
+            warn!(%error, "app/list rejected the stored thread; retrying once globally");
+            collect_apps_paged(client, None, force_refetch).await
+        }
+        other => other,
+    }
+}
+
+async fn collect_apps_paged(
     client: &CodexClient,
     thread_id: Option<String>,
     force_refetch: bool,
@@ -8995,16 +9204,12 @@ fn mcp_catalog_rows(servers: &[Value], view: &str) -> Result<Vec<McpCatalogRow>>
             .and_then(Value::as_str)
             .unwrap_or("unnamed server");
         if view == "servers" {
-            let auth = match server.get("authStatus").and_then(Value::as_str) {
-                Some("notLoggedIn") => "not logged in",
-                Some("bearerToken") => "bearer token",
-                Some("oAuth") | Some("oauth") => "OAuth",
-                Some(status) => status,
-                None => "no auth needed",
-            };
+            // `authStatus` is schema-required; its absence is "unknown",
+            // never "no auth needed".
+            let auth = mcp_auth_label(server.get("authStatus").and_then(Value::as_str));
             rows.push(McpCatalogRow {
                 primary: server_name.to_owned(),
-                secondary: auth.to_owned(),
+                secondary: auth,
                 description: format!(
                     "{} tools · {} resources · {} templates",
                     mcp_collection_len(server.get("tools")),
@@ -9193,7 +9398,13 @@ fn plugin_browser_view(
     let (start, end, page, pages) = page_window(draft.rows.len(), requested_page, 10);
     let mut lines = String::new();
     for row in &draft.rows[start..end] {
-        let status = if !row.enabled {
+        // Same precedence as `connectors::plugin_health`: admin/policy
+        // blocks outrank the enabled flag, which outranks installedness.
+        let status = if row.availability.as_deref() == Some("DISABLED_BY_ADMIN") {
+            "disabled by admin"
+        } else if row.install_policy.as_deref() == Some("NOT_AVAILABLE") {
+            "unavailable"
+        } else if !row.enabled {
             "disabled"
         } else if row.installed {
             "installed"
@@ -9242,6 +9453,62 @@ fn plugin_browser_view(
         embeds::info_card("Codex plugins", &lines),
         components::plugin_browser_controls(token, options, page, pages),
     )
+}
+
+/// Acknowledgement text plus optional install links for `/email`, phrased
+/// from observed Gmail state only. Usability is claimed solely for
+/// [`GmailReadiness::Ready`], which requires app accessibility or a mounted
+/// Gmail tool — never the plugin install alone.
+fn email_ack_for_readiness(readiness: &GmailReadiness) -> (String, Vec<(String, String)>) {
+    match readiness {
+        GmailReadiness::Ready { route } => (
+            match route {
+                GmailRoute::App { .. } => {
+                    "Email request sent to Codex. The Gmail app is accessible; approval may still be required.".to_owned()
+                }
+                GmailRoute::McpTools { tool_count } => format!(
+                    "Email request sent to Codex. {tool_count} Gmail tool{} mounted; approval may still be required.",
+                    if *tool_count == 1 { " is" } else { "s are" }
+                ),
+            },
+            Vec::new(),
+        ),
+        GmailReadiness::PluginUnverified {
+            plugin_name,
+            connect_url,
+        } => (
+            format!(
+                "Email request sent to Codex. The Gmail plugin `{plugin_name}` is installed, but Gmail access is unverified — Codex may request app installation or authorization."
+            ),
+            connect_url
+                .clone()
+                .map(|url| ("Gmail".to_owned(), url))
+                .into_iter()
+                .collect(),
+        ),
+        GmailReadiness::PluginBlocked {
+            plugin_name,
+            health,
+        } => (
+            format!(
+                "Email request sent to Codex, but the Gmail plugin `{plugin_name}` is {} — Codex will likely need setup or another route.",
+                health.label()
+            ),
+            Vec::new(),
+        ),
+        GmailReadiness::AppInstallable { connect_url } => (
+            "Email request sent to Codex. The Gmail app can be installed but is not accessible yet — Codex will request setup, or install it now:".to_owned(),
+            connect_url
+                .clone()
+                .map(|url| ("Gmail".to_owned(), url))
+                .into_iter()
+                .collect(),
+        ),
+        GmailReadiness::NotConfigured => (
+            "Email request sent to Codex. No Gmail plugin or app was observed; Codex may request installation or use another configured route.".to_owned(),
+            Vec::new(),
+        ),
+    }
 }
 
 fn plugin_auth_links(value: &Value) -> Vec<(String, String)> {
@@ -10167,7 +10434,8 @@ mod capability_list_tests {
     use serde_json::json;
 
     use super::{
-        collect_skills, mcp_catalog_rows, model_reasoning_efforts, page_window, plugin_auth_links,
+        ConnectorHealth, GmailReadiness, GmailRoute, collect_skills, email_ack_for_readiness,
+        mcp_catalog_rows, model_reasoning_efforts, page_window, plugin_auth_links,
         plugin_available_mutation, plugin_catalog_rows, plugin_mutation_params,
     };
 
@@ -10305,6 +10573,88 @@ mod capability_list_tests {
             plugin_auth_links(&result),
             [("Gmail".to_owned(), "https://example.test/auth".to_owned())]
         );
+    }
+
+    #[test]
+    fn mcp_server_rows_never_claim_no_auth_needed() {
+        let servers = json!([
+            {"name":"mystery","tools":{},"resources":[],"resourceTemplates":[]},
+            {"name":"blocked","authStatus":"notLoggedIn","tools":{},
+             "resources":[],"resourceTemplates":[]},
+            {"name":"local","authStatus":"unsupported","tools":{},
+             "resources":[],"resourceTemplates":[]}
+        ]);
+        let rows = mcp_catalog_rows(servers.as_array().unwrap(), "servers").unwrap();
+        assert_eq!(rows[0].secondary, "auth status unknown");
+        assert_eq!(rows[1].secondary, "sign-in required");
+        assert_eq!(rows[2].secondary, "no OAuth support");
+    }
+
+    #[test]
+    fn plugin_browser_status_reports_admin_and_policy_blocks() {
+        let result = json!({
+            "marketplaces":[{
+                "name":"official",
+                "plugins":[
+                    {"id":"a","name":"Admin Blocked","installed":true,"enabled":true,
+                     "availability":"DISABLED_BY_ADMIN"},
+                    {"id":"b","name":"Policy Blocked","installed":false,"enabled":true,
+                     "installPolicy":"NOT_AVAILABLE"}
+                ]
+            }]
+        });
+        let rows = plugin_catalog_rows(&result);
+        assert_eq!(rows[0].availability.as_deref(), Some("DISABLED_BY_ADMIN"));
+        assert_eq!(rows[1].install_policy.as_deref(), Some("NOT_AVAILABLE"));
+        assert_eq!(plugin_available_mutation(&rows[0]), None);
+        assert_eq!(plugin_available_mutation(&rows[1]), None);
+    }
+
+    #[test]
+    fn email_ack_claims_usability_only_for_proven_routes() {
+        let (ack, links) = email_ack_for_readiness(&GmailReadiness::Ready {
+            route: GmailRoute::App {
+                app_id: "connector_x".to_owned(),
+            },
+        });
+        assert!(ack.contains("Gmail app is accessible"), "{ack}");
+        assert!(links.is_empty());
+
+        let (ack, _) = email_ack_for_readiness(&GmailReadiness::Ready {
+            route: GmailRoute::McpTools { tool_count: 2 },
+        });
+        assert!(ack.contains("2 Gmail tools are mounted"), "{ack}");
+
+        // The plugin install alone is reported as an unverified fact, with
+        // the install link offered — never as working Gmail.
+        let (ack, links) = email_ack_for_readiness(&GmailReadiness::PluginUnverified {
+            plugin_name: "gmail".to_owned(),
+            connect_url: Some("https://chatgpt.com/apps/gmail/connector_x".to_owned()),
+        });
+        assert!(ack.contains("Gmail access is unverified"), "{ack}");
+        assert_eq!(
+            links,
+            [(
+                "Gmail".to_owned(),
+                "https://chatgpt.com/apps/gmail/connector_x".to_owned()
+            )]
+        );
+
+        let (ack, links) = email_ack_for_readiness(&GmailReadiness::AppInstallable {
+            connect_url: Some("https://chatgpt.com/apps/gmail/connector_x".to_owned()),
+        });
+        assert!(ack.contains("can be installed"), "{ack}");
+        assert_eq!(links.len(), 1);
+
+        let (ack, links) = email_ack_for_readiness(&GmailReadiness::PluginBlocked {
+            plugin_name: "gmail".to_owned(),
+            health: ConnectorHealth::AdminDisabled,
+        });
+        assert!(ack.contains("disabled by admin"), "{ack}");
+        assert!(links.is_empty());
+
+        let (ack, _) = email_ack_for_readiness(&GmailReadiness::NotConfigured);
+        assert!(ack.contains("No Gmail plugin or app was observed"), "{ack}");
     }
 }
 

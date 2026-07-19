@@ -7,6 +7,27 @@ stable public API is declared.
 
 ### Added
 
+- Wire-grounded connector health model (`discord::connectors`) distinguishing accessible
+  ("installed" in official TUI wording), can-be-installed, authenticated, sign-in-required,
+  plugin-installed, available, disabled/admin-disabled, unavailable, no-OAuth-support, and
+  unknown states — every state maps to an observed `app/list`, `plugin/installed`, or
+  `mcpServerStatus/list` field, a schema-documented default, or an explicit unknown.
+- `/apps` now defaults to a merged connector-health overview (apps ⋈ installed plugins ⋈ MCP
+  auth) with problems sorted first and https-only "Install" link buttons; it serves Codex's
+  app cache by default with an explicit `refresh:true` option (a fresh fetch takes ~60–90s),
+  and `/apps scope:directory` keeps the full catalog browse.
+- `/email` verifies Gmail before dispatch and claims usability only on observed proof — app
+  accessibility or an actually mounted Gmail tool inventory; an installed plugin is
+  acknowledged as an unverified fact with the install link offered.
+- `app/list` calls that fail with RPC -32600 "thread not found" for a stored task thread
+  (stale after a Relay restart) retry once globally instead of failing the command.
+- Plugin detail embeds show humanized auth timing, non-default availability, and the ChatGPT
+  apps a plugin drives; the plugin browser surfaces admin-disabled and policy-unavailable states.
+- Read-only live harness (`connectors::live_tests`) that validates the documented wire
+  contract and overview classification against the locally installed Codex app-server,
+  printing only through the crate's central secret redaction plus a home-path scrub, and
+  asserting nothing machine-specific (Gmail checks run only where the plugin exists).
+
 - Native Rust HostBroker with real `codex_app.list_threads` and `codex_app.read_thread` dynamic
   tools, bounded concurrent routing, rich activity rendering, and live-tested cold resume/fork
   inheritance.
@@ -20,6 +41,13 @@ stable public API is declared.
 
 ### Fixed
 
+- Gmail (and any plugin-backed product) is no longer reported with an invented
+  connected/disconnected state: app accessibility now uses the official installed /
+  can-be-installed wording, and the plugin install state is a separate fact on the same row
+  that never upgrades the app's accessibility.
+- `/apps` and `/email` no longer force a full app re-fetch (60–90s) on every invocation.
+- MCP servers with a missing `authStatus` are labeled "auth status unknown" instead of the
+  invented "no auth needed", and `unsupported` renders as "no OAuth support".
 - Realtime audio now latches at the first rejected chunk instead of splicing later audio, preserves
   error state through close, heals interleaved transcript completion, and marks lagged sessions.
 - Digest delivery retries after Discord failures instead of consuming the terminal dirty state.
