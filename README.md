@@ -185,8 +185,10 @@ receive an audited spec or protocol-only classification. Methods absent from an 
 build fail fast with a clear capability message. Run `/capabilities` for the live routing numbers;
 use the live user-flow matrix for end-to-end UX evidence.
 
-Every installed notification has an explicit semantic disposition; command/MCP/patch/realtime
-streams use separate bounded projections and only agent-message delta enters the answer stream.
+Every installed notification has an explicit semantic disposition; command/MCP/patch/realtime and
+task-bound standalone process streams use separate bounded projections, while goal, settings,
+status, safety, hook, review, import, and MCP-startup changes receive dedicated state. Only
+agent-message delta enters the answer stream.
 Every installed server request has an explicit host disposition:
 interactive approvals/input, host-handled time reads, and deliberately unadvertised host
 capabilities that fail closed if a peer violates negotiation. Methods the router knows but the

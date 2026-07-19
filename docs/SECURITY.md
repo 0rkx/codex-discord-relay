@@ -115,11 +115,11 @@ Windows account controls if local data confidentiality matters.
 - A failed post-GOD normalization keeps the task quarantined and retries cleanup.
 - A poison Discord delivery dead-letters after ten attempts and becomes visible in runner status.
 
-One current limit requires operator attention: Codex notifications and server requests enter
-bounded in-memory broadcast receivers. Notification lag is logged and active output projections are
-marked incomplete. Server-request lag is logged and audited because a request dropped before Relay
-receives it cannot receive a Discord card or expiry response. Interrupt that task and investigate
-resource pressure; do not assume the broadcast receiver itself is durable.
+Codex notifications enter a bounded broadcast receiver. Notification lag is logged and active
+output projections are marked incomplete, then authoritative completion events heal supported
+projections. Server requests use a separate bounded MPSC receiver with backpressure and are not
+dropped on capacity overflow; after dequeue, pending interactive requests are persisted before
+Discord delivery.
 
 ## Deployment guidance
 

@@ -23,6 +23,10 @@ stable public API is declared.
 - Realtime audio now latches at the first rejected chunk instead of splicing later audio, preserves
   error state through close, heals interleaved transcript completion, and marks lagged sessions.
 - Digest delivery retries after Discord failures instead of consuming the terminal dirty state.
+- Server-request transport now applies bounded MPSC backpressure instead of dropping approvals when
+  a broadcast consumer lags.
+- Task-bound standalone command/process output is now generation-correlated into live operations;
+  goal, settings, status, MCP startup, and external-config import notifications have Discord state.
 
 ## [0.1.1] - 2026-07-18
 

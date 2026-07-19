@@ -61,9 +61,9 @@ tools through `thread/start.dynamicTools`. Unknown namespaces and tools fail clo
 negotiated-off capabilities are not advertised; if a peer sends one anyway, Relay rejects it
 rather than fabricating a response.
 
-Server-request classification coverage does not make its delivery queue durable. A lagged bounded
-receiver can drop a pending approval and leave a turn waiting. Relay logs and audits this condition;
-interrupt the affected task.
+Server requests use a single-consumer bounded MPSC queue. When its capacity is exhausted, the
+app-server reader applies backpressure instead of dropping a pending approval. Once dequeued, the
+request is persisted before its Discord card is sent.
 
 Once received, an interactive request is bound to its app-server process generation, externally
 resolved requests are tombstoned across setup races, offered policy choices are echoed exactly,
@@ -80,11 +80,13 @@ fully accounted:
 
 Only authoritative agent-message data enters the final answer accumulator. This prevents command
 logs or unrelated deltas from corrupting assistant text. In the audited 70-notification snapshot,
-48 methods feed rendered state and 22 are explicitly audit-only, transport-only, standalone, or
+54 methods feed rendered state and 16 are explicitly audit-only, transport-only, standalone, or
 superseded by authoritative completion. Command/MCP/patch progress, terminal interactions,
-hook/auto-approval/model-safety state, realtime transcript/audio/signals, and completed image items
-have dedicated bounded paths. Raw terminal input, hook paths/messages, review action contents,
-moderation metadata, and WebRTC SDP are never rendered.
+hook/auto-approval/model-safety state, task goals/settings/status, MCP startup, external config
+imports, realtime transcript/audio/signals, and completed image items have dedicated bounded paths.
+Standalone command/process streams launched from a task-bound action are correlated by process
+handle and app-server generation. Raw terminal input, hook paths/messages, review action contents,
+moderation metadata, filesystem paths, diffs, and WebRTC SDP are never rendered.
 
 ## End-to-end evidence
 

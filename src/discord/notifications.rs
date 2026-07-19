@@ -14,6 +14,11 @@ pub enum NotificationDisposition {
     AutoApprovalReview,
     HookLifecycle,
     ModelSafety,
+    GoalState,
+    McpStatus,
+    ThreadSettings,
+    ThreadStatus,
+    ExternalImport,
     StandaloneOutput,
     StandaloneLifecycle,
     TokenUsage,
@@ -126,6 +131,11 @@ pub fn classify(method: &str) -> NotificationDisposition {
         "model/safetyBuffering/updated" | "model/verification" => {
             NotificationDisposition::ModelSafety
         }
+        "thread/goal/updated" | "thread/goal/cleared" => NotificationDisposition::GoalState,
+        "mcpServer/startupStatus/updated" => NotificationDisposition::McpStatus,
+        "thread/settings/updated" => NotificationDisposition::ThreadSettings,
+        "thread/status/changed" => NotificationDisposition::ThreadStatus,
+        "externalAgentConfig/import/completed" => NotificationDisposition::ExternalImport,
         "command/exec/outputDelta" | "process/outputDelta" => {
             NotificationDisposition::StandaloneOutput
         }
@@ -161,16 +171,10 @@ pub fn classify(method: &str) -> NotificationDisposition {
         | "warning"
         | "windows/worldWritableWarning" => NotificationDisposition::UserAlert,
         "app/list/updated"
-        | "externalAgentConfig/import/completed"
         | "fs/changed"
         | "fuzzyFileSearch/sessionCompleted"
-        | "mcpServer/startupStatus/updated"
         | "skills/changed"
-        | "thread/goal/cleared"
-        | "thread/goal/updated"
-        | "thread/settings/updated"
         | "thread/started"
-        | "thread/status/changed"
         | "turn/diff/updated"
         | "turn/moderationMetadata" => NotificationDisposition::AuditOnly,
         _ => NotificationDisposition::Unknown,
@@ -223,8 +227,8 @@ mod tests {
             .iter()
             .filter(|method| is_rendered(classify(method)))
             .count();
-        assert_eq!(rendered, 48);
-        assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 22);
+        assert_eq!(rendered, 54);
+        assert_eq!(CURRENT_NOTIFICATION_METHODS.len() - rendered, 16);
     }
 
     #[test]

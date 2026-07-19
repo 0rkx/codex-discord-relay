@@ -531,7 +531,6 @@ impl ProjectionCore {
         }
     }
 
-    #[cfg(test)]
     #[must_use]
     pub fn process(&self, process_id: &str) -> Option<&ProcessProjection> {
         self.processes.get(process_id)

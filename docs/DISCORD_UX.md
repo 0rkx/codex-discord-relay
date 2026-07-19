@@ -99,6 +99,9 @@ and exists for developer recovery—not routine use.
   payloads. A separate realtime card coalesces transcripts, WebRTC/item signals, and session
   lifecycle, with start/text/voice/stop controls; PCM16 audio is delivered as a bounded WAV
   attachment when the session closes.
+- Goal updates use one editable task-goal card. Thread status/settings follow the Codex task card,
+  and task-bound standalone command/process output is correlated into live operations without
+  exposing its command, environment, or working directory.
 - Generated images and workspace-confined viewed images are validated by magic bytes and delivered
   as Discord attachments through the durable media outbox.
 

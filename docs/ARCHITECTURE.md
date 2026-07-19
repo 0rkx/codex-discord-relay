@@ -104,12 +104,14 @@ ACL management.
   sensitive-message deletion, and GOD expiry.
 - Codex request IDs and server-request replies are bound to one process generation; a connection
   loss fails pending work and a stale Discord card cannot answer a new child.
+- Standalone process handles are bound to the originating task and app-server generation before
+  dispatch, so streamed output cannot cross tasks or reconnect generations.
 - Task ingestion locks prevent the same channel from being replayed concurrently.
 - GOD lifecycle guards prevent activation, expiry, revocation, and privileged dispatch from
   crossing each other. A task stays quarantined until permissions are normalized after GOD use.
-- A lagged Codex notification receiver marks active projections incomplete. A lagged server-request receiver is also audited
-  because a dropped approval could leave a turn waiting; interrupt the affected task if this alert
-  appears. This is a known operational limit, not a durability guarantee for that in-memory queue.
+- A lagged Codex notification receiver marks active projections incomplete. Server requests use a
+  bounded single-consumer MPSC queue, so capacity pressure pauses the app-server reader instead of
+  dropping an approval.
 
 ## Scope boundaries
 

@@ -783,13 +783,13 @@ mod tests {
 
     async fn run_live_tool_turn(
         client: &CodexClient,
+        requests: &mut tokio::sync::mpsc::Receiver<crate::codex::ServerRequest>,
         store: &StateStore,
         thread_id: &str,
         cwd: &str,
         prompt: String,
         expected_tool: &str,
     ) -> String {
-        let mut requests = client.subscribe_server_requests();
         let mut notifications = client.subscribe_notifications();
         let turn = client
             .turn_start(TurnStartParams {
@@ -1071,7 +1071,9 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn live_dynamic_tool_nested_rpc_round_trip() {
         let client = CodexClient::discover().unwrap();
-        let mut requests = client.subscribe_server_requests();
+        let mut requests = client
+            .take_server_requests()
+            .expect("test must own the server-request receiver");
         let mut notifications = client.subscribe_notifications();
         let cwd = std::env::current_dir().unwrap().display().to_string();
         let thread = client
@@ -1197,6 +1199,9 @@ mod tests {
             .unwrap();
 
         let first = CodexClient::discover().unwrap();
+        let mut first_requests = first
+            .take_server_requests()
+            .expect("test must own the first server-request receiver");
         let created = first
             .thread_start(ThreadStartParams {
                 cwd: Some(cwd.clone()),
@@ -1217,6 +1222,7 @@ mod tests {
         let original_id = created["thread"]["id"].as_str().unwrap().to_owned();
         let initial_call = run_live_tool_turn(
             &first,
+            &mut first_requests,
             &store,
             &original_id,
             &cwd,
@@ -1228,6 +1234,9 @@ mod tests {
         first.close().await;
 
         let resumed_client = CodexClient::discover().unwrap();
+        let mut resumed_requests = resumed_client
+            .take_server_requests()
+            .expect("test must own the resumed server-request receiver");
         let resumed = resumed_client
             .thread_resume(ThreadResumeParams {
                 thread_id: original_id.clone(),
@@ -1242,6 +1251,7 @@ mod tests {
         assert_eq!(resumed["thread"]["id"], original_id);
         let resumed_call = run_live_tool_turn(
             &resumed_client,
+            &mut resumed_requests,
             &store,
             &original_id,
             &cwd,
@@ -1268,6 +1278,7 @@ mod tests {
         assert_ne!(child_id, original_id);
         let forked_call = run_live_tool_turn(
             &resumed_client,
+            &mut resumed_requests,
             &store,
             &child_id,
             &cwd,

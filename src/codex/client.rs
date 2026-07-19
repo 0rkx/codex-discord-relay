@@ -441,7 +441,8 @@ struct Inner {
     connected: AtomicBool,
     closed: AtomicBool,
     notifications: broadcast::Sender<Notification>,
-    server_requests: broadcast::Sender<ServerRequest>,
+    server_requests: tokio::sync::mpsc::Sender<ServerRequest>,
+    server_request_receiver: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ServerRequest>>>,
 }
 
 #[derive(Clone)]
@@ -474,7 +475,7 @@ impl CodexClient {
         let (notifications, _) = broadcast::channel(4_096);
         // A dropped server request is an approval Codex waits on forever, so
         // this buffer is sized far beyond any realistic pending-request burst.
-        let (server_requests, _) = broadcast::channel(1_024);
+        let (server_requests, server_request_receiver) = tokio::sync::mpsc::channel(1_024);
         Self {
             inner: Arc::new(Inner {
                 command,
@@ -492,6 +493,7 @@ impl CodexClient {
                 closed: AtomicBool::new(false),
                 notifications,
                 server_requests,
+                server_request_receiver: std::sync::Mutex::new(Some(server_request_receiver)),
             }),
         }
     }
@@ -502,13 +504,22 @@ impl CodexClient {
     }
 
     #[must_use]
-    pub fn subscribe_server_requests(&self) -> broadcast::Receiver<ServerRequest> {
-        self.inner.server_requests.subscribe()
+    pub fn take_server_requests(&self) -> Option<tokio::sync::mpsc::Receiver<ServerRequest>> {
+        self.inner
+            .server_request_receiver
+            .lock()
+            .ok()
+            .and_then(|mut receiver| receiver.take())
     }
 
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.inner.connected.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
     }
 
     pub async fn connect(&self) -> Result<(), ClientError> {
@@ -1223,7 +1234,11 @@ async fn handle_incoming(inner: &Arc<Inner>, generation: u64, value: Value) {
         }
         Ok(WireMessage::ServerRequest(mut request)) => {
             request.generation = generation;
-            let _ = inner.server_requests.send(request);
+            if inner.server_requests.send(request).await.is_err() {
+                tracing::error!(
+                    "server-request consumer closed; Codex may remain waiting for a response"
+                );
+            }
         }
         Err(error) => tracing::warn!(%error, "ignoring malformed app-server message"),
     }
@@ -1272,8 +1287,12 @@ mod tests {
     use tokio::io::duplex;
 
     fn test_inner() -> Arc<Inner> {
+        test_inner_with_server_request_capacity(8)
+    }
+
+    fn test_inner_with_server_request_capacity(capacity: usize) -> Arc<Inner> {
         let (notifications, _) = broadcast::channel(8);
-        let (server_requests, _) = broadcast::channel(8);
+        let (server_requests, server_request_receiver) = tokio::sync::mpsc::channel(capacity);
         Arc::new(Inner {
             command: CodexCommand::new("codex"),
             request_timeout: Duration::from_secs(1),
@@ -1290,6 +1309,7 @@ mod tests {
             closed: AtomicBool::new(false),
             notifications,
             server_requests,
+            server_request_receiver: std::sync::Mutex::new(Some(server_request_receiver)),
         })
     }
 
@@ -1312,7 +1332,12 @@ mod tests {
         assert_eq!(notification.method, "turn/completed");
         assert_eq!(notification.generation, 1);
 
-        let mut requests = inner.server_requests.subscribe();
+        let mut requests = inner
+            .server_request_receiver
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
         handle_incoming(
             &inner,
             1,
@@ -1322,6 +1347,45 @@ mod tests {
         let request = requests.recv().await.unwrap();
         assert_eq!(request.id, "approval-1");
         assert_eq!(request.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn server_request_delivery_applies_backpressure_instead_of_dropping() {
+        let inner = test_inner_with_server_request_capacity(1);
+        let mut requests = inner
+            .server_request_receiver
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+
+        handle_incoming(
+            &inner,
+            1,
+            json!({"id": 1, "method": "item/commandExecution/requestApproval", "params": {}}),
+        )
+        .await;
+        let blocked_inner = Arc::clone(&inner);
+        let blocked = tokio::spawn(async move {
+            handle_incoming(
+                &blocked_inner,
+                1,
+                json!({"id": 2, "method": "item/fileChange/requestApproval", "params": {}}),
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !blocked.is_finished(),
+            "full queue must backpressure the reader"
+        );
+        assert_eq!(requests.recv().await.unwrap().id, json!(1));
+        tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("blocked delivery must resume after capacity frees")
+            .unwrap();
+        assert_eq!(requests.recv().await.unwrap().id, json!(2));
     }
 
     #[test]

@@ -182,6 +182,19 @@ struct PlanBoard {
     dirty: bool,
 }
 
+#[derive(Default)]
+struct GoalBoard {
+    message_id: Option<u64>,
+    goal: Option<Value>,
+    dirty: bool,
+}
+
+#[derive(Clone)]
+struct StandaloneProcessBinding {
+    thread_id: String,
+    operation_id: String,
+}
+
 const MAX_REALTIME_TRANSCRIPT_CHARS: usize = 12_000;
 // Discord's default per-file ceiling is 10 MiB. Keep room for multipart
 // framing and the 44-byte WAV header instead of assuming a boosted guild.
@@ -635,7 +648,7 @@ struct BotState {
     early_codex_receivers: std::sync::Mutex<
         Option<(
             tokio::sync::broadcast::Receiver<Notification>,
-            tokio::sync::broadcast::Receiver<ServerRequest>,
+            tokio::sync::mpsc::Receiver<ServerRequest>,
         )>,
     >,
     god: RwLock<Arc<GodModeService>>,
@@ -646,10 +659,12 @@ struct BotState {
     streams: Mutex<HashMap<String, StreamBuffer>>,
     activity: Mutex<HashMap<String, ActivityDigest>>,
     plans: Mutex<HashMap<String, PlanBoard>>,
+    goals: Mutex<HashMap<String, GoalBoard>>,
     realtime: Mutex<HashMap<String, RealtimeDigest>>,
     projection: Mutex<ProjectionCore>,
     operations: Mutex<HashMap<String, OperationsDigest>>,
     delivered_media: dashmap::DashSet<String>,
+    standalone_process_tasks: dashmap::DashMap<String, StandaloneProcessBinding>,
     ingestion_locks: dashmap::DashMap<u64, Arc<Mutex<()>>>,
     pending_server_requests: dashmap::DashMap<String, ServerRequest>,
     pending_request_started: dashmap::DashMap<String, std::time::Instant>,
@@ -2177,11 +2192,32 @@ impl Handler {
                 }),
             )
             .await?;
-        let result = self
+        let standalone_binding = standalone_action_binding(draft, self.state.codex.generation());
+        if let Some((key, binding)) = standalone_binding.as_ref() {
+            self.state
+                .standalone_process_tasks
+                .insert(key.clone(), binding.clone());
+        }
+        let result = match self
             .state
             .codex
             .request_value(&draft.method, draft.params.clone())
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some((key, _)) = standalone_binding.as_ref() {
+                    self.state.standalone_process_tasks.remove(key);
+                }
+                return Err(error.into());
+            }
+        };
+        if draft.method == "command/exec"
+            && let Some((key, binding)) = standalone_binding.as_ref()
+        {
+            complete_bound_standalone_action(&self.state, key, binding, &result).await;
+            self.state.standalone_process_tasks.remove(key);
+        }
         let result_controls = if draft.method == "plugin/install" {
             components::plugin_auth_buttons(plugin_auth_links(&result))
         } else {
@@ -4823,13 +4859,14 @@ pub async fn run() -> Result<()> {
     let capabilities = Arc::new(capabilities);
     let codex = CodexClient::new(codex_command);
     let host_broker = HostBroker::new(codex.clone(), store.clone());
+    let server_requests = codex
+        .take_server_requests()
+        .context("Codex server-request receiver was already taken")?;
     // Subscribe before the first connect: notifications Codex emits while the
     // Discord gateway is still starting buffer in these receivers until
     // `spawn_codex_listeners` drains them at gateway-ready.
-    let early_codex_receivers = std::sync::Mutex::new(Some((
-        codex.subscribe_notifications(),
-        codex.subscribe_server_requests(),
-    )));
+    let early_codex_receivers =
+        std::sync::Mutex::new(Some((codex.subscribe_notifications(), server_requests)));
     codex.connect().await?;
     let state = Arc::new(BotState {
         config,
@@ -4845,10 +4882,12 @@ pub async fn run() -> Result<()> {
         streams: Mutex::new(HashMap::new()),
         activity: Mutex::new(HashMap::new()),
         plans: Mutex::new(HashMap::new()),
+        goals: Mutex::new(HashMap::new()),
         realtime: Mutex::new(HashMap::new()),
         projection: Mutex::new(ProjectionCore::new()),
         operations: Mutex::new(HashMap::new()),
         delivered_media: dashmap::DashSet::new(),
+        standalone_process_tasks: dashmap::DashMap::new(),
         ingestion_locks: dashmap::DashMap::new(),
         pending_server_requests: dashmap::DashMap::new(),
         pending_request_started: dashmap::DashMap::new(),
@@ -5144,17 +5183,15 @@ fn spawn_codex_listeners(state: Arc<BotState>, http: Arc<Http>) {
     // Prefer the receivers subscribed in `run()` before the first Codex
     // connect: anything Codex emitted while the Discord gateway was starting
     // is buffered there instead of lost.
-    let (mut notifications, mut requests) = state
+    let Some((mut notifications, mut requests)) = state
         .early_codex_receivers
         .lock()
         .ok()
         .and_then(|mut receivers| receivers.take())
-        .unwrap_or_else(|| {
-            (
-                state.codex.subscribe_notifications(),
-                state.codex.subscribe_server_requests(),
-            )
-        });
+    else {
+        error!("Codex listeners were started without their reserved receivers");
+        return;
+    };
     let notification_state = Arc::clone(&state);
     let notification_http = Arc::clone(&http);
     tokio::spawn(async move {
@@ -5198,49 +5235,26 @@ fn spawn_codex_listeners(state: Arc<BotState>, http: Arc<Http>) {
     tokio::spawn(async move {
         let dynamic_tool_concurrency = Arc::new(tokio::sync::Semaphore::new(8));
         let interactive_concurrency = Arc::new(tokio::sync::Semaphore::new(32));
-        loop {
-            match requests.recv().await {
-                Ok(request) => {
-                    let state = Arc::clone(&state);
-                    let http = Arc::clone(&http);
-                    let concurrency = if ServerRequestMethod::classify(&request.method)
-                        == ServerRequestMethod::DynamicToolCall
-                    {
-                        Arc::clone(&dynamic_tool_concurrency)
-                    } else {
-                        Arc::clone(&interactive_concurrency)
-                    };
-                    tokio::spawn(async move {
-                        let Ok(_permit) = concurrency.acquire_owned().await else {
-                            return;
-                        };
-                        if let Err(error) = handle_server_request(&state, &http, request).await {
-                            error!(%error, "server request handling failed");
-                        }
-                    });
+        while let Some(request) = requests.recv().await {
+            let state = Arc::clone(&state);
+            let http = Arc::clone(&http);
+            let concurrency = if ServerRequestMethod::classify(&request.method)
+                == ServerRequestMethod::DynamicToolCall
+            {
+                Arc::clone(&dynamic_tool_concurrency)
+            } else {
+                Arc::clone(&interactive_concurrency)
+            };
+            tokio::spawn(async move {
+                let Ok(_permit) = concurrency.acquire_owned().await else {
+                    return;
+                };
+                if let Err(error) = handle_server_request(&state, &http, request).await {
+                    error!(%error, "server request handling failed");
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    // A dropped server request leaves Codex waiting on an
-                    // approval no card exists for; make that loudly visible.
-                    error!(
-                        count,
-                        "Codex server-request consumer lagged; a pending approval may never render — interrupt the affected task"
-                    );
-                    let _ = state
-                        .store
-                        .audit(
-                            "codex_server_request_lagged",
-                            None,
-                            Some(state.config.guild_id),
-                            None,
-                            None,
-                            &json!({"dropped": count}),
-                        )
-                        .await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
+            });
         }
+        error!("Codex server-request receiver closed");
     });
 }
 
@@ -5257,6 +5271,9 @@ fn spawn_stream_flusher(state: Arc<BotState>, http: Arc<Http>) {
             }
             if let Err(error) = flush_plans(&state, &http).await {
                 warn!(%error, "plan flush failed");
+            }
+            if let Err(error) = flush_goals(&state, &http).await {
+                warn!(%error, "goal flush failed");
             }
             if let Err(error) = flush_realtime(&state, &http).await {
                 warn!(%error, "realtime transcript flush failed");
@@ -5858,6 +5875,38 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
             project_model_safety(state, &event).await;
             return Ok(());
         }
+        NotificationDisposition::GoalState => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            if let Some(thread_id) = thread_id {
+                let mut goals = state.goals.lock().await;
+                let board = goals.entry(thread_id.to_owned()).or_default();
+                board.goal = event.params.get("goal").cloned();
+                board.dirty = true;
+            }
+            flush_goals(state, http).await?;
+            return Ok(());
+        }
+        NotificationDisposition::McpStatus => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            post_mcp_startup_failure(state, http, &event).await?;
+            refresh_runner_status(state, http).await?;
+            return Ok(());
+        }
+        NotificationDisposition::ThreadSettings => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            apply_thread_settings(state, http, &event).await?;
+            return Ok(());
+        }
+        NotificationDisposition::ThreadStatus => {
+            persist_notification_audit(state, &event, thread_id).await?;
+            apply_thread_status(state, http, &event).await?;
+            return Ok(());
+        }
+        NotificationDisposition::ExternalImport => {
+            persist_notification_audit(state, &event, None).await?;
+            post_external_import_summary(state, http, &event).await?;
+            return Ok(());
+        }
         NotificationDisposition::StandaloneOutput => {
             project_standalone_output(state, &event).await;
             return Ok(());
@@ -6154,6 +6203,10 @@ async fn handle_notification(state: &BotState, http: &Http, event: Notification)
     ) {
         state.realtime.lock().await.remove(thread_id);
         state.operations.lock().await.remove(thread_id);
+        state.goals.lock().await.remove(thread_id);
+        state
+            .standalone_process_tasks
+            .retain(|_, binding| binding.thread_id != thread_id);
         let media_prefix = format!("{thread_id}:");
         state
             .delivered_media
@@ -6220,6 +6273,178 @@ async fn post_notification_alert(
         .send_message(http, CreateMessage::new().embed(embed))
         .await?;
     Ok(())
+}
+
+async fn post_mcp_startup_failure(
+    state: &BotState,
+    http: &Http,
+    event: &Notification,
+) -> Result<()> {
+    if event.params.get("status").and_then(Value::as_str) != Some("failed") {
+        return Ok(());
+    }
+    let Some(layout) = state.layout.read().await.clone() else {
+        return Ok(());
+    };
+    let reauth = event.params.get("failureReason").and_then(Value::as_str)
+        == Some("reauthenticationRequired");
+    let detail = if reauth {
+        "An MCP server requires authentication. Open `/mcp` for the live catalog and reconnect it through Codex."
+    } else {
+        "An MCP server failed to start. Open `/mcp` for its current status."
+    };
+    layout
+        .audit_log_channel
+        .send_message(
+            http,
+            CreateMessage::new()
+                .embed(embeds::error_card("MCP startup failed", detail))
+                .allowed_mentions(CreateAllowedMentions::new()),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn post_external_import_summary(
+    state: &BotState,
+    http: &Http,
+    event: &Notification,
+) -> Result<()> {
+    let Some(layout) = state.layout.read().await.clone() else {
+        return Ok(());
+    };
+    let mut successes = 0_usize;
+    let mut failures = 0_usize;
+    let mut kinds = Vec::new();
+    for result in event
+        .params
+        .get("itemTypeResults")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        successes = successes.saturating_add(
+            result
+                .get("successes")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        );
+        failures = failures.saturating_add(
+            result
+                .get("failures")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+        );
+        if let Some(kind) =
+            safe_external_import_kind(result.get("itemType").and_then(Value::as_str))
+            && !kinds.contains(&kind)
+        {
+            kinds.push(kind);
+        }
+    }
+    let description = format!(
+        "Imported {successes} item(s); {failures} failed. Types: {}.",
+        if kinds.is_empty() {
+            "none".to_owned()
+        } else {
+            kinds.join(", ")
+        }
+    );
+    layout
+        .audit_log_channel
+        .send_message(
+            http,
+            CreateMessage::new()
+                .embed(embeds::info_card(
+                    "External Codex config import",
+                    &description,
+                ))
+                .allowed_mentions(CreateAllowedMentions::new()),
+        )
+        .await?;
+    Ok(())
+}
+
+fn safe_external_import_kind(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    [
+        "AGENTS_MD",
+        "CONFIG",
+        "SKILLS",
+        "PLUGINS",
+        "MCP_SERVER_CONFIG",
+        "SUBAGENTS",
+        "HOOKS",
+        "COMMANDS",
+        "MEMORY",
+        "SESSIONS",
+    ]
+    .contains(&value)
+    .then(|| value.to_owned())
+}
+
+async fn apply_thread_settings(state: &BotState, http: &Http, event: &Notification) -> Result<()> {
+    let Some(thread_id) = crate::codex::thread_id_from_params(&event.params) else {
+        return Ok(());
+    };
+    let Some(mut task) = state.store.task(thread_id).await? else {
+        return Ok(());
+    };
+    if let Some(model) = event
+        .params
+        .pointer("/threadSettings/model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        task.model = Some(truncate_chars(model, 100));
+    }
+    task.last_event_at = Some(Utc::now());
+    state.store.upsert_task(&task).await?;
+    refresh_task_card(http, &task, Some("Codex task settings updated")).await?;
+    Ok(())
+}
+
+async fn apply_thread_status(state: &BotState, http: &Http, event: &Notification) -> Result<()> {
+    let Some(thread_id) = crate::codex::thread_id_from_params(&event.params) else {
+        return Ok(());
+    };
+    let Some(mut task) = state.store.task(thread_id).await? else {
+        return Ok(());
+    };
+    let Some(next) =
+        task_state_from_thread_status(event.params.get("status").unwrap_or(&Value::Null))
+    else {
+        return Ok(());
+    };
+    if task.state == next {
+        return Ok(());
+    }
+    task.state = next;
+    task.last_event_at = Some(Utc::now());
+    state.store.upsert_task(&task).await?;
+    if let Some(channel) = task.channel_id.map(ChannelId::new) {
+        provision::move_task_to_state(http, &state.config, channel, next).await?;
+    }
+    refresh_task_card(http, &task, None).await?;
+    refresh_runner_status(state, http).await?;
+    Ok(())
+}
+
+fn task_state_from_thread_status(status: &Value) -> Option<TaskState> {
+    Some(match status.get("type").and_then(Value::as_str) {
+        Some("active")
+            if status
+                .get("activeFlags")
+                .and_then(Value::as_array)
+                .is_some_and(|flags| !flags.is_empty()) =>
+        {
+            TaskState::NeedsUser
+        }
+        Some("active") => TaskState::Running,
+        Some("systemError") => TaskState::Failed,
+        Some("idle" | "notLoaded") => TaskState::Idle,
+        _ => return None,
+    })
 }
 
 async fn refresh_task_card(http: &Http, task: &TaskMirror, note: Option<&str>) -> Result<()> {
@@ -6808,6 +7033,85 @@ async fn handle_server_request(
     Ok(())
 }
 
+fn standalone_action_binding(
+    draft: &ActionDraft,
+    generation: u64,
+) -> Option<(String, StandaloneProcessBinding)> {
+    let thread_id = draft.task_id.as_ref()?;
+    let (kind, handle) = match draft.method.as_str() {
+        "command/exec" => ("command", draft.params.get("processId")?.as_str()?),
+        "process/spawn" => ("process", draft.params.get("processHandle")?.as_str()?),
+        _ => return None,
+    };
+    let key = format!("{kind}:{generation}:{handle}");
+    Some((
+        key.clone(),
+        StandaloneProcessBinding {
+            thread_id: thread_id.clone(),
+            operation_id: format!("standalone:{key}"),
+        },
+    ))
+}
+
+fn standalone_event_key(event: &Notification, handle: &str) -> String {
+    let kind = if event.method.starts_with("command/") {
+        "command"
+    } else {
+        "process"
+    };
+    format!("{kind}:{}:{handle}", event.generation)
+}
+
+async fn complete_bound_standalone_action(
+    state: &BotState,
+    key: &str,
+    binding: &StandaloneProcessBinding,
+    result: &Value,
+) {
+    let exit_code = result
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let completion = exit_code.map_or(CompletionState::Unknown, |code| {
+        if code == 0 {
+            CompletionState::Succeeded
+        } else {
+            CompletionState::Failed
+        }
+    });
+    let stdout = result
+        .get("stdout")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(OutputChunk::utf8);
+    let stderr = result
+        .get("stderr")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(OutputChunk::utf8);
+    let summary = {
+        let mut projection = state.projection.lock().await;
+        if let Err(error) = projection.complete_process(key, completion, exit_code, stdout, stderr)
+        {
+            warn!(
+                process_key = key,
+                ?error,
+                "standalone command completion projection failed"
+            );
+        }
+        projection.process(key).map(format_process_projection)
+    };
+    if let Some(summary) = summary {
+        state
+            .operations
+            .lock()
+            .await
+            .entry(binding.thread_id.clone())
+            .or_default()
+            .upsert(&binding.operation_id, summary);
+    }
+}
+
 async fn project_standalone_output(state: &BotState, event: &Notification) {
     let process_id = event
         .params
@@ -6817,6 +7121,7 @@ async fn project_standalone_output(state: &BotState, event: &Notification) {
     let Some(process_id) = process_id else {
         return;
     };
+    let key = standalone_event_key(event, process_id);
     let Some(delta) = event.params.get("deltaBase64").and_then(Value::as_str) else {
         return;
     };
@@ -6825,16 +7130,30 @@ async fn project_standalone_output(state: &BotState, event: &Notification) {
     } else {
         OutputStream::Stdout
     };
-    if let Err(error) = state.projection.lock().await.push_process_output(
-        process_id,
-        stream,
-        OutputChunk::base64(delta),
-    ) {
-        warn!(
-            process_id,
-            ?error,
-            "standalone process projection rejected a chunk"
-        );
+    let summary = {
+        let mut projection = state.projection.lock().await;
+        if let Err(error) = projection.push_process_output(&key, stream, OutputChunk::base64(delta))
+        {
+            warn!(
+                process_id,
+                ?error,
+                "standalone process projection rejected a chunk"
+            );
+        }
+        projection.process(&key).map(format_process_projection)
+    };
+    let binding = state
+        .standalone_process_tasks
+        .get(&key)
+        .map(|entry| entry.clone());
+    if let (Some(binding), Some(summary)) = (binding, summary) {
+        state
+            .operations
+            .lock()
+            .await
+            .entry(binding.thread_id)
+            .or_default()
+            .upsert(&binding.operation_id, summary);
     }
 }
 
@@ -6847,6 +7166,7 @@ async fn project_standalone_completion(state: &BotState, event: &Notification) {
     else {
         return;
     };
+    let key = standalone_event_key(event, process_id);
     let exit_code = event
         .params
         .get("exitCode")
@@ -6871,17 +7191,28 @@ async fn project_standalone_completion(state: &BotState, event: &Notification) {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(OutputChunk::utf8);
-    if let Err(error) = state
-        .projection
-        .lock()
-        .await
-        .complete_process(process_id, completion, exit_code, stdout, stderr)
+    let summary = {
+        let mut projection = state.projection.lock().await;
+        if let Err(error) = projection.complete_process(&key, completion, exit_code, stdout, stderr)
+        {
+            warn!(
+                process_id,
+                ?error,
+                "standalone process completion projection failed"
+            );
+        }
+        projection.process(&key).map(format_process_projection)
+    };
+    if let Some((_, binding)) = state.standalone_process_tasks.remove(&key)
+        && let Some(summary) = summary
     {
-        warn!(
-            process_id,
-            ?error,
-            "standalone process completion projection failed"
-        );
+        state
+            .operations
+            .lock()
+            .await
+            .entry(binding.thread_id)
+            .or_default()
+            .upsert(&binding.operation_id, summary);
     }
 }
 
@@ -7323,6 +7654,38 @@ fn format_command_projection(command: &crate::discord::projection::CommandProjec
     }
 }
 
+fn format_process_projection(process: &crate::discord::projection::ProcessProjection) -> String {
+    let icon = if process.active {
+        "⏳"
+    } else if process.completion == Some(CompletionState::Succeeded) {
+        "✅"
+    } else {
+        "❌"
+    };
+    let mut output = process.output.stdout.clone();
+    if !process.output.stderr.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&process.output.stderr);
+    }
+    let output = truncate_chars(&output.replace('`', "ˋ"), 700);
+    let markers = operation_markers(
+        process.output.capped,
+        process.output.incomplete,
+        process.output.lagged,
+    );
+    let exit = process
+        .exit_code
+        .map(|code| format!(" · exit {code}"))
+        .unwrap_or_default();
+    if output.is_empty() {
+        format!("{icon} **Standalone process**{exit} · waiting for output{markers}")
+    } else {
+        format!("{icon} **Standalone process**{exit}{markers}\n```text\n{output}\n```")
+    }
+}
+
 fn format_mcp_projection(progress: &crate::discord::projection::McpProgressProjection) -> String {
     let icon = if progress.active {
         "🧰"
@@ -7398,6 +7761,25 @@ async fn flush_plans(state: &BotState, http: &Http) -> Result<()> {
         |board| {
             std::mem::take(&mut board.dirty)
                 .then(|| DigestRender::embed(embeds::plan_card(&board.params)))
+        },
+        |board| board.dirty = true,
+        |board| &mut board.message_id,
+    )
+    .await
+}
+
+async fn flush_goals(state: &BotState, http: &Http) -> Result<()> {
+    flush_digests(
+        state,
+        http,
+        &state.goals,
+        |board| {
+            std::mem::take(&mut board.dirty).then(|| {
+                DigestRender::embed(board.goal.as_ref().map_or_else(
+                    || embeds::info_card("Task goal cleared", "This task has no active goal."),
+                    embeds::goal_card,
+                ))
+            })
         },
         |board| board.dirty = true,
         |board| &mut board.message_id,
@@ -10104,6 +10486,74 @@ mod server_request_setup_tests {
         };
 
         assert!(mcp_elicitation_has_empty_form_schema(&request));
+    }
+}
+
+#[cfg(test)]
+mod notification_projection_tests {
+    use serde_json::json;
+
+    use super::{
+        Notification, TaskState, safe_external_import_kind, standalone_event_key,
+        task_state_from_thread_status,
+    };
+
+    #[test]
+    fn thread_status_maps_waiting_flags_without_exposing_payloads() {
+        assert_eq!(
+            task_state_from_thread_status(&json!({
+                "type": "active",
+                "activeFlags": ["waitingOnApproval"]
+            })),
+            Some(TaskState::NeedsUser)
+        );
+        assert_eq!(
+            task_state_from_thread_status(&json!({"type": "active", "activeFlags": []})),
+            Some(TaskState::Running)
+        );
+        assert_eq!(
+            task_state_from_thread_status(&json!({"type": "systemError"})),
+            Some(TaskState::Failed)
+        );
+        assert_eq!(
+            task_state_from_thread_status(&json!({"type": "futureStatus", "secret": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn external_import_summary_accepts_only_installed_item_kinds() {
+        assert_eq!(
+            safe_external_import_kind(Some("PLUGINS")).as_deref(),
+            Some("PLUGINS")
+        );
+        assert_eq!(safe_external_import_kind(Some("C:/private/config")), None);
+        assert_eq!(safe_external_import_kind(None), None);
+    }
+
+    #[test]
+    fn standalone_process_keys_are_method_and_generation_scoped() {
+        let command = Notification {
+            method: "command/exec/outputDelta".to_owned(),
+            params: json!({}),
+            generation: 7,
+        };
+        let process = Notification {
+            method: "process/outputDelta".to_owned(),
+            params: json!({}),
+            generation: 7,
+        };
+        assert_eq!(standalone_event_key(&command, "same"), "command:7:same");
+        assert_eq!(standalone_event_key(&process, "same"), "process:7:same");
+
+        let newer = Notification {
+            generation: 8,
+            ..command
+        };
+        assert_ne!(
+            standalone_event_key(&newer, "same"),
+            standalone_event_key(&process, "same")
+        );
     }
 }
 
