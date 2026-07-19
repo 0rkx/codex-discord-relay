@@ -527,8 +527,81 @@ struct PluginBrowserDraft {
     created_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Clone)]
+enum TypedInputChoice {
+    Skill {
+        name: String,
+        path: String,
+        description: String,
+    },
+    App {
+        name: String,
+        app_id: String,
+        description: String,
+    },
+    File {
+        name: String,
+        relative_path: String,
+        description: String,
+    },
+}
+
+impl TypedInputChoice {
+    fn name(&self) -> &str {
+        match self {
+            Self::Skill { name, .. } | Self::App { name, .. } | Self::File { name, .. } => name,
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Skill { description, .. }
+            | Self::App { description, .. }
+            | Self::File { description, .. } => description,
+        }
+    }
+
+    fn user_inputs(&self, prompt: String) -> Vec<UserInput> {
+        match self {
+            Self::Skill { name, path, .. } => vec![
+                UserInput::Skill {
+                    name: name.clone(),
+                    path: path.clone(),
+                },
+                UserInput::text(prompt),
+            ],
+            Self::App { name, app_id, .. } => vec![
+                UserInput::Mention {
+                    name: name.clone(),
+                    path: format!("app://{app_id}"),
+                },
+                UserInput::text(prompt),
+            ],
+            // Codex has no file UserInput variant. Upstream only resolves
+            // `mention` for capability URIs, so a file is addressed in text
+            // using the already validated task-relative workspace path.
+            Self::File { relative_path, .. } => vec![UserInput::text(format!(
+                "Use the workspace file at path {} for this request.\n\n{prompt}",
+                serde_json::to_string(relative_path)
+                    .expect("serializing a Rust string cannot fail")
+            ))],
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TypedInputDraft {
+    owner_id: u64,
+    channel_id: u64,
+    thread_id: String,
+    noun: &'static str,
+    choices: Vec<TypedInputChoice>,
+    created_at: chrono::DateTime<Utc>,
+}
+
 const TASK_BROWSER_TTL_MINUTES: i64 = 20;
 const PLUGIN_BROWSER_TTL_MINUTES: i64 = 20;
+const TYPED_INPUT_TTL_MINUTES: i64 = 15;
 
 #[derive(Clone, Copy)]
 struct CodexExecutionPolicy {
@@ -642,6 +715,12 @@ impl PluginBrowserDraft {
     }
 }
 
+impl TypedInputDraft {
+    fn expired(&self) -> bool {
+        Utc::now() - self.created_at > chrono::Duration::minutes(TYPED_INPUT_TTL_MINUTES)
+    }
+}
+
 struct BotState {
     config: Arc<Config>,
     store: StateStore,
@@ -678,6 +757,7 @@ struct BotState {
     action_drafts: dashmap::DashMap<String, ActionDraft>,
     task_browsers: dashmap::DashMap<String, TaskBrowserDraft>,
     plugin_browsers: dashmap::DashMap<String, PluginBrowserDraft>,
+    typed_input_drafts: dashmap::DashMap<String, TypedInputDraft>,
     runner_status_message_id: AtomicU64,
     god_warning_channel_id: AtomicU64,
     god_warning_message_id: AtomicU64,
@@ -1191,6 +1271,8 @@ impl Handler {
         } else if id == components::ACTION_METHOD {
             let method = selected_value(&component)?;
             self.begin_action(&ctx.http, &component, method).await?;
+        } else if let Some(token) = components::custom_id_arg(id, components::TYPED_INPUT_SELECT) {
+            self.begin_typed_input(&ctx.http, &component, token).await?;
         } else if id == components::MODEL_SELECT {
             self.apply_model_selection(&ctx.http, &component).await?;
         } else if id == components::MODE_SELECT {
@@ -1325,6 +1407,13 @@ impl Handler {
             components::GOD_MODAL => self.enable_god(&ctx.http, &modal).await?,
             components::CONTINUE_MODAL => self.continue_from_modal(&ctx.http, &modal).await?,
             components::EMAIL_MODAL => self.send_email(&ctx.http, &modal).await?,
+            custom_id if custom_id.starts_with(components::TYPED_INPUT_MODAL) => {
+                let rest = components::custom_id_arg(custom_id, components::TYPED_INPUT_MODAL)
+                    .context("missing typed input token")?;
+                let (token, index) = rest.rsplit_once(':').context("invalid typed input token")?;
+                self.dispatch_typed_input(&ctx.http, &modal, token, index.parse()?)
+                    .await?;
+            }
             custom_id if custom_id.starts_with(components::ACTION_FORM_MODAL) => {
                 let rest = components::custom_id_arg(custom_id, components::ACTION_FORM_MODAL)
                     .context("missing action form token")?;
@@ -1744,6 +1833,150 @@ impl Handler {
                 EditInteractionResponse::new()
                     .content(ack)
                     .components(components::connector_link_buttons(connect_links)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn typed_input_controls(
+        &self,
+        command: &CommandInteraction,
+        task: Option<&TaskMirror>,
+        noun: &'static str,
+        choices: Vec<TypedInputChoice>,
+    ) -> Vec<CreateActionRow> {
+        let Some(task) = task else {
+            return Vec::new();
+        };
+        if choices.is_empty() {
+            return Vec::new();
+        }
+        self.state
+            .typed_input_drafts
+            .retain(|_, draft| !draft.expired());
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let options = choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| {
+                (
+                    index,
+                    choice.name().to_owned(),
+                    choice.description().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.state.typed_input_drafts.insert(
+            token.clone(),
+            TypedInputDraft {
+                owner_id: command.user.id.get(),
+                channel_id: command.channel_id.get(),
+                thread_id: task.thread_id.clone(),
+                noun,
+                choices,
+                created_at: Utc::now(),
+            },
+        );
+        components::typed_input_select(&token, noun, options)
+    }
+
+    async fn begin_typed_input(
+        &self,
+        http: &Http,
+        component: &ComponentInteraction,
+        token: &str,
+    ) -> Result<()> {
+        let index = selected_value(component)?
+            .parse::<usize>()
+            .context("invalid typed input choice")?;
+        let draft = self
+            .state
+            .typed_input_drafts
+            .get(token)
+            .map(|draft| draft.clone())
+            .context("selection expired; run the command again")?;
+        validate_typed_input_draft(
+            &draft,
+            component.user.id.get(),
+            component.channel_id.get(),
+            None,
+        )?;
+        anyhow::ensure!(
+            draft.choices.get(index).is_some(),
+            "selection is no longer available"
+        );
+        component
+            .create_response(
+                http,
+                CreateInteractionResponse::Modal(
+                    CreateModal::new(
+                        format!("{}:{token}:{index}", components::TYPED_INPUT_MODAL),
+                        format!("Use selected {}", draft.noun),
+                    )
+                    .components(components::typed_input_prompt(draft.noun)),
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn dispatch_typed_input(
+        &self,
+        http: &Http,
+        modal: &ModalInteraction,
+        token: &str,
+        index: usize,
+    ) -> Result<()> {
+        let (_, draft) = self
+            .state
+            .typed_input_drafts
+            .remove(token)
+            .context("selection expired; run the command again")?;
+        validate_typed_input_draft(&draft, modal.user.id.get(), modal.channel_id.get(), None)?;
+        let choice = draft
+            .choices
+            .get(index)
+            .context("selection is no longer available")?
+            .clone();
+        let prompt = modal_value(modal, "prompt")
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .context("prompt required")?
+            .to_owned();
+        defer_modal(http, modal).await?;
+        let mut task = self.task_for_channel(modal.channel_id).await?;
+        validate_typed_input_draft(
+            &draft,
+            modal.user.id.get(),
+            modal.channel_id.get(),
+            Some(&task.thread_id),
+        )?;
+        if let TypedInputChoice::File { relative_path, .. } = &choice {
+            let root = task
+                .cwd
+                .as_deref()
+                .context("this task has no working directory")?;
+            validate_workspace_file(root, relative_path).await?;
+        }
+        let security_context = self
+            .security_context(http, modal.user.id.get(), modal.guild_id, modal.channel_id)
+            .await;
+        self.dispatch_task_input(
+            http,
+            &security_context,
+            modal.channel_id,
+            &mut task,
+            choice.user_inputs(prompt),
+            "typed Codex input dispatch",
+        )
+        .await?;
+        modal
+            .edit_response(
+                http,
+                EditInteractionResponse::new().content(format!(
+                    "Sent the selected {} to Codex. Live response follows here.",
+                    draft.noun
+                )),
             )
             .await?;
         Ok(())
@@ -2263,11 +2496,13 @@ impl Handler {
             complete_bound_standalone_action(&self.state, key, binding, &result).await;
             self.state.standalone_process_tasks.remove(key);
         }
-        let result_controls = if draft.method == "plugin/install" {
-            components::plugin_auth_buttons(plugin_auth_links(&result))
-        } else {
-            Vec::new()
+        let result_controls = match draft.method.as_str() {
+            "plugin/install" => components::plugin_auth_buttons(plugin_auth_links(&result)),
+            "mcpServer/oauth/login" => components::plugin_auth_buttons(mcp_oauth_links(&result)),
+            _ => Vec::new(),
         };
+        let semantic_error = draft.method == "mcpServer/tool/call"
+            && result.get("isError").and_then(Value::as_bool) == Some(true);
         if let Err(error) = self
             .state
             .store
@@ -2284,22 +2519,35 @@ impl Handler {
                     "authorization": policy.authorization.audit_label(),
                     "confirmation": policy.confirmation.audit_label(),
                     "params_hash": stable_value_hash(&draft.params),
-                    "accepted": true
+                    "accepted": !semantic_error,
+                    "semantic_error": semantic_error
                 }),
             )
             .await
         {
             error!(%error, %action_id, "action succeeded but outcome audit could not be persisted");
         }
-        let redacted = crate::security::redact_detail(result);
-        let pretty = serde_json::to_string_pretty(&redacted)?;
+        let redacted = if matches!(
+            draft.method.as_str(),
+            "mcpServer/resource/read" | "mcpServer/tool/call"
+        ) {
+            crate::security::redact_secrets(&result)
+        } else {
+            crate::security::redact_detail(result)
+        };
+        let pretty = bounded_action_result(serde_json::to_string_pretty(&redacted)?);
         let pages = embeds::split_answer(&pretty, 3800);
         let result_title = draft.renderer.result_title();
+        let task_state = if semantic_error {
+            TaskState::Failed
+        } else {
+            TaskState::Idle
+        };
         let mut response = EditInteractionResponse::new()
             .embed(embeds::codex_answer(
                 &format!("{}: {}", result_title, draft.label),
                 pages.first().map(String::as_str).unwrap_or("{}"),
-                TaskState::Idle,
+                task_state,
                 1,
                 pages.len().max(1),
             ))
@@ -3355,12 +3603,12 @@ impl Handler {
             .filter(|query| !query.is_empty())
             .map(str::to_ascii_lowercase);
         let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
-        let cwd = self
+        let task = self
             .state
             .store
             .task_by_channel(command.channel_id.get())
-            .await?
-            .and_then(|task| task.cwd);
+            .await?;
+        let cwd = task.as_ref().and_then(|task| task.cwd.clone());
         let result = self
             .state
             .codex
@@ -3370,6 +3618,7 @@ impl Handler {
             })
             .await?;
         let mut skills = collect_skills(&result);
+        skills.retain(selectable_skill);
         if let Some(query) = query.as_deref() {
             skills.retain(|skill| {
                 ["name", "id", "description", "path"]
@@ -3413,10 +3662,35 @@ impl Handler {
             "\n\nPage {page}/{pages} · {} skills",
             skills.len()
         ));
+        let choices = skills[start..end]
+            .iter()
+            .filter_map(|skill| {
+                let name = skill
+                    .get("name")
+                    .or_else(|| skill.get("id"))
+                    .and_then(Value::as_str)?;
+                let path = skill.get("path").and_then(Value::as_str)?;
+                let description = skill
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Run this Codex skill")
+                    .lines()
+                    .next()
+                    .unwrap_or("Run this Codex skill");
+                Some(TypedInputChoice::Skill {
+                    name: name.to_owned(),
+                    path: path.to_owned(),
+                    description: description.to_owned(),
+                })
+            })
+            .collect();
+        let controls = self.typed_input_controls(command, task.as_ref(), "skill", choices);
         command
             .edit_response(
                 http,
-                EditInteractionResponse::new().embed(embeds::info_card("Codex skills", &lines)),
+                EditInteractionResponse::new()
+                    .embed(embeds::info_card("Codex skills", &lines))
+                    .components(controls),
             )
             .await?;
         Ok(())
@@ -3548,12 +3822,12 @@ impl Handler {
         let requested_page = integer_command_option(command, "page").unwrap_or(1).max(1) as usize;
         // Cached by default: a fresh app/list fetch takes 60–90 seconds.
         let refresh = boolean_command_option(command, "refresh").unwrap_or(false);
-        let thread_id = self
+        let task = self
             .state
             .store
             .task_by_channel(command.channel_id.get())
-            .await?
-            .map(|task| task.thread_id);
+            .await?;
+        let thread_id = task.as_ref().map(|task| task.thread_id.clone());
         let mut apps = collect_apps(&self.state.codex, thread_id, refresh)
             .await?
             .iter()
@@ -3590,11 +3864,33 @@ impl Handler {
             lines.push_str("No apps/connectors available.");
         }
         lines.push_str(&format!("\n\nPage {page}/{pages} · {} apps", apps.len()));
+        let choices = apps[start..end]
+            .iter()
+            .filter(|app| app_health(app) == ConnectorHealth::Accessible)
+            .map(|app| TypedInputChoice::App {
+                name: app.name.clone(),
+                app_id: app.id.clone(),
+                description: "Use this accessible Codex app".to_owned(),
+            })
+            .collect();
+        let mut controls = self.typed_input_controls(command, task.as_ref(), "app", choices);
+        let install_links = apps[start..end]
+            .iter()
+            .filter(|app| app_health(app) == ConnectorHealth::CanInstall)
+            .filter_map(|app| app.install_url.clone().map(|url| (app.name.clone(), url)))
+            .take((5_usize.saturating_sub(controls.len())) * 5)
+            .collect::<Vec<_>>();
+        controls.extend(
+            components::connector_link_buttons(install_links)
+                .into_iter()
+                .take(5_usize.saturating_sub(controls.len())),
+        );
         command
             .edit_response(
                 http,
                 EditInteractionResponse::new()
-                    .embed(embeds::info_card("Codex app directory", &lines)),
+                    .embed(embeds::info_card("Codex app directory", &lines))
+                    .components(controls),
             )
             .await?;
         Ok(())
@@ -4585,36 +4881,59 @@ impl Handler {
             .codex
             .fuzzy_file_search(FuzzyFileSearchParams {
                 query: query.clone(),
-                roots: vec![root],
+                roots: vec![root.clone()],
                 cancellation_token: None,
             })
             .await?;
         let files = first_result_array(&result, &["files", "results", "data", "items"]);
+        let selectable = files
+            .iter()
+            .take(20)
+            .filter(|file| file.get("match_type").and_then(Value::as_str) == Some("file"))
+            .filter_map(|file| {
+                let path = file.get("path").and_then(Value::as_str)?;
+                let relative = workspace_relative_path(&root, path)?;
+                let name = relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("workspace file")
+                    .to_owned();
+                Some((name, relative.display().to_string()))
+            })
+            .collect::<Vec<_>>();
         let mut lines = String::new();
-        for file in files.iter().take(20) {
-            let path = file
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("(unknown path)");
+        for (index, (name, _)) in selectable.iter().enumerate() {
             lines.push_str(&format!(
-                "`{}`\n",
-                path.chars().take(180).collect::<String>()
+                "{}. **{}**\n",
+                index + 1,
+                name.chars().take(120).collect::<String>()
             ));
         }
         if lines.is_empty() {
             lines = format!("No workspace files matched `{query}`.");
         }
         push_more_indicator(&mut lines, files.len(), 20);
+        let choices = selectable
+            .into_iter()
+            .map(|(name, relative_path)| TypedInputChoice::File {
+                name,
+                relative_path,
+                description: "Attach this workspace file to the next Codex turn".to_owned(),
+            })
+            .collect();
+        let controls = self.typed_input_controls(command, Some(&task), "file", choices);
         command
             .edit_response(
                 http,
-                EditInteractionResponse::new().embed(embeds::info_card(
-                    &format!(
-                        "File search: {}",
-                        query.chars().take(180).collect::<String>()
-                    ),
-                    &lines,
-                )),
+                EditInteractionResponse::new()
+                    .embed(embeds::info_card(
+                        &format!(
+                            "File search: {}",
+                            query.chars().take(180).collect::<String>()
+                        ),
+                        &lines,
+                    ))
+                    .components(controls),
             )
             .await?;
         Ok(())
@@ -5072,6 +5391,7 @@ pub async fn run() -> Result<()> {
         action_drafts: dashmap::DashMap::new(),
         task_browsers: dashmap::DashMap::new(),
         plugin_browsers: dashmap::DashMap::new(),
+        typed_input_drafts: dashmap::DashMap::new(),
         runner_status_message_id: AtomicU64::new(0),
         god_warning_channel_id: AtomicU64::new(0),
         god_warning_message_id: AtomicU64::new(0),
@@ -9089,6 +9409,66 @@ fn boolean_command_option(command: &CommandInteraction, name: &str) -> Option<bo
     })
 }
 
+fn validate_typed_input_draft(
+    draft: &TypedInputDraft,
+    owner_id: u64,
+    channel_id: u64,
+    thread_id: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(!draft.expired(), "selection expired; run the command again");
+    anyhow::ensure!(
+        draft.owner_id == owner_id && draft.channel_id == channel_id,
+        "selection belongs to another user or channel"
+    );
+    if let Some(thread_id) = thread_id {
+        anyhow::ensure!(
+            draft.thread_id == thread_id,
+            "task changed after this selection was created"
+        );
+    }
+    Ok(())
+}
+
+fn workspace_relative_path(root: &str, candidate: &str) -> Option<PathBuf> {
+    let candidate = Path::new(candidate);
+    let relative = if candidate.is_absolute() {
+        candidate.strip_prefix(Path::new(root)).ok()?
+    } else {
+        candidate
+    };
+    let mut clean = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => clean.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!clean.as_os_str().is_empty()).then_some(clean)
+}
+
+async fn validate_workspace_file(root: &str, relative: &str) -> Result<PathBuf> {
+    let relative = workspace_relative_path(root, relative)
+        .context("selected file path is not task-relative")?;
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .context("working directory is unavailable")?;
+    let candidate = tokio::fs::canonicalize(root.join(relative))
+        .await
+        .context("selected file is unavailable")?;
+    anyhow::ensure!(
+        tokio::fs::metadata(&candidate).await?.is_file(),
+        "selected path is not a file"
+    );
+    anyhow::ensure!(
+        candidate.starts_with(&root),
+        "selected file is outside the task working directory"
+    );
+    Ok(candidate)
+}
+
 async fn resume_task_for_relay(client: &CodexClient, thread_id: &str) -> Result<Value> {
     Ok(client
         .thread_resume(ThreadResumeParams {
@@ -9164,6 +9544,19 @@ async fn collect_apps_paged(
 }
 
 async fn collect_mcp_servers(
+    client: &CodexClient,
+    thread_id: Option<String>,
+) -> Result<Vec<Value>> {
+    match collect_mcp_servers_paged(client, thread_id.clone()).await {
+        Err(error) if thread_id.is_some() && is_thread_not_found(&error) => {
+            warn!(%error, "MCP status rejected the stored thread; retrying once globally");
+            collect_mcp_servers_paged(client, None).await
+        }
+        other => other,
+    }
+}
+
+async fn collect_mcp_servers_paged(
     client: &CodexClient,
     thread_id: Option<String>,
 ) -> Result<Vec<Value>> {
@@ -9558,6 +9951,29 @@ fn plugin_auth_links(value: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+fn mcp_oauth_links(value: &Value) -> Vec<(String, String)> {
+    value
+        .get("authorizationUrl")
+        .and_then(Value::as_str)
+        .and_then(components::safe_https_url)
+        .map(|url| vec![("MCP server".to_owned(), url)])
+        .unwrap_or_default()
+}
+
+fn bounded_action_result(mut value: String) -> String {
+    const MAX_BYTES: usize = 1_000_000;
+    if value.len() <= MAX_BYTES {
+        return value;
+    }
+    let mut boundary = MAX_BYTES;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value.push_str("\n\n[Result truncated by Relay at 1,000,000 bytes.]");
+    value
+}
+
 fn plugin_load_error_count(value: &Value) -> usize {
     value
         .get("marketplaceLoadErrors")
@@ -9606,6 +10022,19 @@ fn first_result_array<'a>(value: &'a Value, keys: &[&str]) -> &'a [Value] {
 
 /// `skills/list` groups entries by requested cwd in current Codex builds.
 /// Normalize the older flat response at the same boundary.
+fn selectable_skill(skill: &Value) -> bool {
+    skill.get("enabled").and_then(Value::as_bool) == Some(true)
+        && skill
+            .get("name")
+            .or_else(|| skill.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+        && skill
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
 fn collect_skills(value: &Value) -> Vec<Value> {
     let direct = first_result_array(value, &["data", "skills", "items"]);
     let grouped = direct
@@ -10464,9 +10893,11 @@ mod capability_list_tests {
     use serde_json::json;
 
     use super::{
-        ConnectorHealth, GmailReadiness, GmailRoute, collect_skills, email_ack_for_readiness,
-        email_turn_input, mcp_catalog_rows, model_reasoning_efforts, page_window,
-        plugin_auth_links, plugin_available_mutation, plugin_catalog_rows, plugin_mutation_params,
+        ConnectorHealth, GmailReadiness, GmailRoute, TypedInputChoice, TypedInputDraft,
+        bounded_action_result, collect_skills, email_ack_for_readiness, email_turn_input,
+        mcp_catalog_rows, mcp_oauth_links, model_reasoning_efforts, page_window, plugin_auth_links,
+        plugin_available_mutation, plugin_catalog_rows, plugin_mutation_params, selectable_skill,
+        validate_typed_input_draft, validate_workspace_file, workspace_relative_path,
     };
 
     #[test]
@@ -10482,6 +10913,20 @@ mod capability_list_tests {
             .filter_map(|skill| skill["name"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
         assert_eq!(names, ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn only_enabled_well_formed_skills_are_selectable() {
+        assert!(selectable_skill(&json!({
+            "name":"review", "path":"C:/skills/review/SKILL.md", "enabled":true
+        })));
+        assert!(!selectable_skill(&json!({
+            "name":"review", "path":"C:/skills/review/SKILL.md", "enabled":false
+        })));
+        assert!(!selectable_skill(&json!({
+            "name":"review", "path":"C:/skills/review/SKILL.md"
+        })));
+        assert!(!selectable_skill(&json!({"name":"review","enabled":true})));
     }
 
     #[test]
@@ -10606,6 +11051,36 @@ mod capability_list_tests {
     }
 
     #[test]
+    fn mcp_oauth_exposes_only_safe_https_link() {
+        assert_eq!(
+            mcp_oauth_links(&json!({"authorizationUrl":"https://example.test/oauth"})),
+            [(
+                "MCP server".to_owned(),
+                "https://example.test/oauth".to_owned()
+            )]
+        );
+        for unsafe_url in [
+            "http://example.test/oauth",
+            "javascript:alert(1)",
+            "https://user:secret@example.test/oauth",
+            "not a URL",
+        ] {
+            assert!(
+                mcp_oauth_links(&json!({"authorizationUrl":unsafe_url})).is_empty(),
+                "unsafe OAuth URL should be rejected: {unsafe_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_result_has_hard_byte_limit() {
+        let oversized = "x".repeat(1_000_100);
+        let bounded = bounded_action_result(oversized);
+        assert!(bounded.len() < 1_000_100);
+        assert!(bounded.contains("Result truncated by Relay"));
+    }
+
+    #[test]
     fn mcp_server_rows_never_claim_no_auth_needed() {
         let servers = json!([
             {"name":"mystery","tools":{},"resources":[],"resourceTemplates":[]},
@@ -10704,6 +11179,93 @@ mod capability_list_tests {
             serde_json::to_value(&without_app).unwrap()[0]["type"],
             "text"
         );
+    }
+
+    #[test]
+    fn typed_catalog_choices_emit_exact_codex_input_shapes() {
+        let skill = TypedInputChoice::Skill {
+            name: "review".to_owned(),
+            path: "C:/catalog/review/SKILL.md".to_owned(),
+            description: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(skill.user_inputs("check this".to_owned())).unwrap(),
+            json!([
+                {"type":"skill","name":"review","path":"C:/catalog/review/SKILL.md"},
+                {"type":"text","text":"check this"}
+            ])
+        );
+
+        let app = TypedInputChoice::App {
+            name: "Gmail".to_owned(),
+            app_id: "connector_fixture".to_owned(),
+            description: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(app.user_inputs("find mail".to_owned())).unwrap(),
+            json!([
+                {"type":"mention","name":"Gmail","path":"app://connector_fixture"},
+                {"type":"text","text":"find mail"}
+            ])
+        );
+
+        let file = TypedInputChoice::File {
+            name: "main.rs".to_owned(),
+            relative_path: "src/main.rs".to_owned(),
+            description: String::new(),
+        };
+        let value = serde_json::to_value(file.user_inputs("review it".to_owned())).unwrap();
+        assert_eq!(value[0]["type"], "text");
+        assert!(value[0]["text"].as_str().unwrap().contains("src/main.rs"));
+        assert!(!value.to_string().contains("mention"));
+    }
+
+    #[test]
+    fn workspace_file_choices_reject_absolute_and_parent_escape_paths() {
+        assert_eq!(
+            workspace_relative_path("C:/work", "src/main.rs").unwrap(),
+            std::path::PathBuf::from("src/main.rs")
+        );
+        assert!(workspace_relative_path("C:/work", "../secret.txt").is_none());
+        assert!(workspace_relative_path("C:/work", "C:/other/secret.txt").is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_file_dispatch_revalidates_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("input.txt");
+        std::fs::write(&file, b"fixture").unwrap();
+        let root = root.path().to_str().unwrap();
+        assert!(validate_workspace_file(root, "input.txt").await.is_ok());
+        assert!(validate_workspace_file(root, "missing.txt").await.is_err());
+        assert!(validate_workspace_file(root, ".").await.is_err());
+        assert!(
+            validate_workspace_file(root, "../outside.txt")
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn typed_input_drafts_are_owner_channel_thread_and_ttl_bound() {
+        let mut draft = TypedInputDraft {
+            owner_id: 1,
+            channel_id: 2,
+            thread_id: "thread-3".to_owned(),
+            noun: "app",
+            choices: vec![TypedInputChoice::App {
+                name: "Fixture".to_owned(),
+                app_id: "connector_fixture".to_owned(),
+                description: String::new(),
+            }],
+            created_at: chrono::Utc::now(),
+        };
+        assert!(validate_typed_input_draft(&draft, 1, 2, Some("thread-3")).is_ok());
+        assert!(validate_typed_input_draft(&draft, 9, 2, Some("thread-3")).is_err());
+        assert!(validate_typed_input_draft(&draft, 1, 9, Some("thread-3")).is_err());
+        assert!(validate_typed_input_draft(&draft, 1, 2, Some("thread-9")).is_err());
+        draft.created_at -= chrono::Duration::minutes(16);
+        assert!(validate_typed_input_draft(&draft, 1, 2, Some("thread-3")).is_err());
     }
 }
 

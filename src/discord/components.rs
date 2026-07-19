@@ -1,3 +1,4 @@
+use reqwest::Url;
 use serenity::{
     all::{ButtonStyle, InputTextStyle},
     builder::{
@@ -42,6 +43,8 @@ pub const MODEL_SELECT: &str = "relay:model_select";
 pub const TERMINAL_KILL: &str = "relay:terminal_kill";
 pub const TERMINAL_CLEAN: &str = "relay:terminal_clean";
 pub const MODE_SELECT: &str = "relay:mode_select";
+pub const TYPED_INPUT_SELECT: &str = "relay:typed_input";
+pub const TYPED_INPUT_MODAL: &str = "relay:typed_input_modal";
 pub const PLUGIN_ACTIONS: &str = "relay:plugin_actions";
 pub const PLUGIN_SELECT: &str = "relay:plugin_select";
 pub const PLUGIN_INSTALL: &str = "relay:plugin_install";
@@ -166,6 +169,55 @@ pub fn action_category_select(
             .placeholder("Choose an action family")
             .min_values(1)
             .max_values(1),
+    )]
+}
+
+#[must_use]
+pub fn typed_input_select(
+    token: &str,
+    noun: &str,
+    choices: impl IntoIterator<Item = (usize, String, String)>,
+) -> Vec<CreateActionRow> {
+    let options = choices
+        .into_iter()
+        .take(25)
+        .map(|(index, label, description)| {
+            CreateSelectMenuOption::new(
+                safe_single_line(&label, 100, "Unnamed choice"),
+                index.to_string(),
+            )
+            .description(safe_single_line(
+                &description,
+                100,
+                "Use this choice with Codex",
+            ))
+        })
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        return Vec::new();
+    }
+    vec![CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(
+            format!("{TYPED_INPUT_SELECT}:{token}"),
+            CreateSelectMenuKind::String { options },
+        )
+        .placeholder(truncate(&format!("Use a {noun}"), 150))
+        .min_values(1)
+        .max_values(1),
+    )]
+}
+
+#[must_use]
+pub fn typed_input_prompt(noun: &str) -> Vec<CreateActionRow> {
+    vec![CreateActionRow::InputText(
+        CreateInputText::new(
+            InputTextStyle::Paragraph,
+            truncate(&format!("What should Codex do with this {noun}?"), 45),
+            "prompt",
+        )
+        .placeholder("Give Codex the task or question")
+        .required(true)
+        .max_length(4_000),
     )]
 }
 
@@ -295,6 +347,22 @@ fn truncate(value: &str, max: usize) -> String {
         output.push('…');
     }
     output
+}
+
+fn safe_single_line(value: &str, max: usize, fallback: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate(
+        if cleaned.is_empty() {
+            fallback
+        } else {
+            &cleaned
+        },
+        max,
+    )
 }
 
 #[must_use]
@@ -464,7 +532,7 @@ fn link_button_rows(
 ) -> Vec<CreateActionRow> {
     let buttons = items
         .into_iter()
-        .filter(|(_, url)| url.len() <= 2_048 && url.starts_with("https://"))
+        .filter_map(|(name, url)| safe_https_url(&url).map(|url| (name, url)))
         .take(20)
         .map(|(name, url)| {
             CreateButton::new_link(url)
@@ -476,6 +544,24 @@ fn link_button_rows(
         .chunks(5)
         .map(|chunk| CreateActionRow::Buttons(chunk.to_vec()))
         .collect()
+}
+
+/// Accept only bounded HTTPS links without embedded credentials. Returned
+/// value is normalized before it reaches a Discord link button.
+#[must_use]
+pub(crate) fn safe_https_url(raw: &str) -> Option<String> {
+    if raw.len() > 2_048 {
+        return None;
+    }
+    let parsed = Url::parse(raw).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(parsed.into())
 }
 
 #[must_use]
@@ -493,9 +579,7 @@ pub fn elicitation_confirmation_buttons(request_id: &str) -> Vec<CreateActionRow
 #[must_use]
 pub fn elicitation_url_buttons(request_id: &str, url: Option<&str>) -> Vec<CreateActionRow> {
     let mut buttons = Vec::new();
-    if let Some(url) = url.filter(|url| {
-        (url.starts_with("https://") || url.starts_with("http://")) && url.len() <= 2_048
-    }) {
+    if let Some(url) = url.and_then(safe_https_url) {
         buttons.push(
             CreateButton::new_link(url)
                 .label("Open secure page")
@@ -748,6 +832,26 @@ mod tests {
     }
 
     #[test]
+    fn typed_input_picker_keeps_capability_data_out_of_discord_ids() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let rows = serde_json::to_value(typed_input_select(
+            token,
+            "skill",
+            [(0, "Review\nunsafe".to_owned(), "Review\rcode".to_owned())],
+        ))
+        .unwrap();
+        let custom_id = rows[0]["components"][0]["custom_id"].as_str().unwrap();
+        assert_eq!(custom_id, format!("{TYPED_INPUT_SELECT}:{token}"));
+        assert!(custom_id.len() <= 100);
+        assert_eq!(rows[0]["components"][0]["options"][0]["value"], "0");
+        assert!(!custom_id.contains("Review"));
+        assert_eq!(
+            rows[0]["components"][0]["options"][0]["label"],
+            "Review unsafe"
+        );
+    }
+
+    #[test]
     fn realtime_controls_match_session_lifecycle() {
         let active = serde_json::to_value(realtime_buttons(true)).unwrap();
         assert_eq!(active[0]["components"][0]["custom_id"], REALTIME_TEXT);
@@ -815,5 +919,24 @@ mod tests {
         )]))
         .unwrap();
         assert!(auth.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn secure_links_reject_credentials_and_plain_http() {
+        assert_eq!(
+            safe_https_url("https://example.test/oauth"),
+            Some("https://example.test/oauth".to_owned())
+        );
+        assert!(safe_https_url("http://example.test/oauth").is_none());
+        assert!(safe_https_url("https://user:secret@example.test/oauth").is_none());
+        assert!(safe_https_url("javascript:alert(1)").is_none());
+
+        let controls = serde_json::to_value(elicitation_url_buttons(
+            "request-1",
+            Some("http://example.test/oauth"),
+        ))
+        .unwrap();
+        assert!(controls.to_string().contains("I completed it"));
+        assert!(!controls.to_string().contains("http://"));
     }
 }

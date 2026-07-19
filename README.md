@@ -43,6 +43,9 @@ Public documentation:
 - Task productivity commands: `/goal` (objective/budget tracking), `/history` (recent turn
   digest), `/terminals` (list/terminate/clean background terminals), `/files` (fuzzy workspace
   file search), `/mode` (collaboration presets), and `/effort` (reasoning effort for new turns)
+- Task-channel `/skills`, `/apps scope:directory`, and `/files` results can be selected directly,
+  followed by a private prompt modal. Opaque server-side tokens keep skill paths, connector IDs,
+  and file paths out of Discord custom IDs; files are revalidated inside the task workspace.
 - `/find` full-text search across every Codex task with snippets; results open directly into
   private task channels
 - `/mcp` searches and paginates the complete MCP server, tool, resource, and resource-template catalogs

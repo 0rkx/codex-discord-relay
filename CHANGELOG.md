@@ -30,6 +30,10 @@ stable public API is declared.
   machine-specific (Gmail checks run only where the plugin exists).
 - Installed-Codex model harnesses now prove a native `webSearch` item plus sourced answer and the
   production existing-task resume path across a fresh app-server process and second turn.
+- `/skills`, accessible `/apps scope:directory` entries, and `/files` now provide owner/channel/
+  task-bound opaque selectors plus a prompt modal. Skills and apps use native Codex `skill` and
+  `mention` inputs. Files use a revalidated task-relative path because Codex has no file input
+  variant; absolute paths never enter Discord components or model history.
 
 - Native Rust HostBroker with real `codex_app.list_threads` and `codex_app.read_thread` dynamic
   tools, bounded concurrent routing, rich activity rendering, and live-tested cold resume/fork
